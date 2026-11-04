@@ -12,6 +12,7 @@ import shutil
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from claude_agent_sdk import get_session_info, list_sessions
@@ -438,11 +439,14 @@ class Engine:
             state = self.store.task(tid)["state"]
             if state != "cancelled":
                 uncertain = state in ("running", "stopping")
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
+                site = f"{Path(frame.filename).name}:{frame.lineno}"
+                cause = f"{type(exc).__name__} ({site}, code={getattr(exc,'winerror',None)})"
                 with self.db:
                     self.store.finish(
                         tid,
                         "unknown" if uncertain else "failed",
-                        "执行中断，请核对历史和文件" if uncertain else f"准备失败：{type(exc).__name__}",
+                        "执行中断，请核对历史和文件" if uncertain else f"准备失败：{cause}",
                     )
                     if not uncertain and not self.store.task(tid)["card"]:
                         self.db.execute(

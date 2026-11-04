@@ -113,7 +113,7 @@ async def test_worker_crash_after_commit_retries_card_only(app, tmp_path, monkey
     monkeypatch.setattr("oncall_bot.desktop.engine.launch_args", lambda _: [sys.executable, str(child)])
     await app.on_message(message("original", "fix"))
     await app.execute(app.store.task(1))
-    assert app.store.task(1)["state"] == "succeeded"
+    assert app.store.task(1)["state"] == "succeeded", app.store.task(1)["result"]
     recovered = Store(app.store.root)
     try:
         recovered.recover()

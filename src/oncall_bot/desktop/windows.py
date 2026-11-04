@@ -16,6 +16,9 @@ import win32job
 import win32process
 
 
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # winbase.h; absent in win32con.
+
+
 def attach_job(pid):
     job = win32job.CreateJobObject(None, None)
     try:
@@ -66,7 +69,7 @@ def project_io(root, identity, path, operation, content, limit):
                 win32con.FILE_SHARE_READ,
                 None,
                 win32con.OPEN_EXISTING,
-                win32con.FILE_FLAG_BACKUP_SEMANTICS | win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+                win32con.FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                 None,
             )
             stack.callback(handle.Close)
@@ -95,7 +98,7 @@ def project_io(root, identity, path, operation, content, limit):
                 win32con.FILE_SHARE_READ,
                 None,
                 win32con.OPEN_EXISTING,
-                win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT,
                 None,
             )
             stack.callback(handle.Close)
