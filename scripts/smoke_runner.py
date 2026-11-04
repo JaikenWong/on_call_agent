@@ -616,6 +616,32 @@ async def check_docs(cfg: Config) -> None:
         check("正文里图片位置留了占位说明", body.count("未能下载") == 2, str(body.count("未能下载")))
         check("正文文字没受影响", "把按钮改成蓝色" in body)
 
+    # 6.4b 文档不允许下载素材（飞书返回 403 且响应体为空）
+    api_403 = FakeApi()
+    api_403.media_error = FeishuApiError(None, "", None, http_status=403)
+    out_403 = await DocFetcher(api_403, cfg.docs).fetch(  # type: ignore[arg-type]
+        "看下 https://abc.feishu.cn/docx/Abcd1234EfGh5678", "smoke-403"
+    )
+    check("403 时正文照常抓到", len(out_403.docs) == 1, f"docs={len(out_403.docs)}")
+    if out_403.docs:
+        d403 = out_403.docs[0]
+        check("403 只给一条提示，不是每张图一条", len(d403.image_notes) == 1,
+              f"notes={len(d403.image_notes)}")
+        check("403 提示区分于「缺权限」且可操作",
+              "403" in d403.image_notes[0] and "可编辑" in d403.image_notes[0],
+              d403.image_notes[0][:60])
+
+    # 6.4c 其他错误要折叠成一条，不能每张图刷一行
+    api_err2 = FakeApi()
+    api_err2.media_error = FeishuApiError(12345, "boom", None, http_status=500)
+    out_err2 = await DocFetcher(api_err2, cfg.docs).fetch(  # type: ignore[arg-type]
+        "看下 https://abc.feishu.cn/docx/Abcd1234EfGh5678", "smoke-err"
+    )
+    if out_err2.docs:
+        notes = out_err2.docs[0].image_notes
+        check("普通失败折叠成一条提示", len(notes) == 1, f"notes={len(notes)}")
+        check("折叠提示里带失败张数", "图 1" in notes[0] and "图 2" in notes[0], notes[0][:80])
+
     # 6.5 blocks 接口挂了 → 退回 raw_content
     api_fb = FakeApi()
     api_fb.blocks_error = FeishuApiError(99999, "blocks unavailable", None)

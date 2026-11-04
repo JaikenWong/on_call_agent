@@ -133,7 +133,25 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL = deepseek-v4-pro[1m]
 | 文档块结构 | `client.docx.v1.document_block.list` | 需要更精细的结构时用 |
 | 知识库节点 | **没有** `wiki.v2.space_node.get` | 必须走原生请求 `/open-apis/wiki/v2/spaces/get_node?token=&obj_type=wiki` → `data.node.{obj_type, obj_token, title}` |
 | 消息里的附件 | `client.im.v1.message_resource.aget` | 第一版不用，留给文件附件支持 |
-| 缺权限错误码 | `99991672` | 响应体 `msg` 里会列出可用的 scope 清单和申请链接，可以直接转给用户 |
+| 缺权限错误码 | HTTP 400 + `code 99991672` | 响应体 `msg` 里会列出可用的 scope 清单和申请链接，可以直接转给用户 |
+| 资源级拒绝 | **HTTP 403 + 响应体完全为空** | 没有任何 `code`/`msg` 可读，只能靠 HTTP 状态判断 |
+
+#### 素材下载的三层权限（实测踩完）
+
+图片下载失败有三种完全不同的原因，提示语必须分开，否则用户照着改也改不对：
+
+| 现象 | 原因 | 怎么改 |
+|------|------|--------|
+| HTTP 400 + `99991672` | 应用没开通 scope | 加 `drive:drive:readonly`（或 `docs:document.media:download`），**发布新版本并等审核通过** |
+| **HTTP 403 + 空响应体** | scope 够了，但这篇文档不允许下载素材 | 文档「更多设置」里「可复制、打印、下载」常限制为「仅可编辑的人」，而机器人只有可阅读。要么把机器人提升为可编辑协作者，要么放宽该设置 |
+| 正文也读不到 | 机器人对文档没有任何权限 | 加为协作者，或文档设为组织内可阅读 |
+
+判断方法：`/open-apis/drive/v1/permissions/{token}/public` 能读到 `security_entity`，值为 `anyone_can_edit` 就意味着只有可编辑的人能下载。实测那篇文档正文读得到（`raw_content` 正常 6883 字）、图片和附件全部 403，就是这一种。
+
+另外两个实现要点：
+
+- `batch_get_tmp_download_url` 在这种情况下返回 `code: 0` 但 `tmp_download_urls: []`，**成功的返回码配空结果**，不能只看 code 判断。
+- 这两种拒绝对整篇文档的每张图都一样，必须**第一张就 break**，否则 24 张图会发 24 次无用请求、刷 24 条一样的提示。其余零散失败要折叠成一条。
 
 #### block_type 对照（对着真实文档逐个核对，不是查文档猜的）
 
@@ -514,7 +532,8 @@ if handle.abort_reason:
 
 - 图片写到 md 同目录的 `<文档名>-<token8>.assets/img-NN.<ext>`，扩展名按**文件头魔术字节**判断，不信任接口。
 - markdown 里用 `![图 N](C:/绝对/路径.png)`（正斜杠），既是合法 markdown 也能直接喂给 Read 工具。文件头和 prompt 里都说明「需要看图时用 Read 读这个文件」。
-- 遇到 `99991672` 立刻停止本篇剩余图片（缺权限对每张图都一样，没必要试 N 次），并给出要申请的具体 scope 名。
+- 遇到 `99991672`（应用缺 scope）或 HTTP 403（文档不允许下载素材）立刻停止本篇剩余图片，并给出对应的、可操作的改法。两种原因的提示必须不同，见 2.8。
+- 其余零散失败折叠成一条提示，最多列 5 张图再给总数。
 - 下载不到的图片在正文原位留「（图 N 未能下载，原因见本文件开头的说明）」，**不留空、不静默跳过**。
 
 必须满足：

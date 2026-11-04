@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import docx_render
 from .config import DocsConfig
-from .feishu.api import SCOPE_DENIED_CODE, FeishuApi, FeishuApiError
+from .feishu.api import RESOURCE_DENIED_STATUS, SCOPE_DENIED_CODE, FeishuApi, FeishuApiError
 
 log = logging.getLogger(__name__)
 
@@ -45,9 +45,19 @@ PERMISSION_HINT = (
 
 IMAGE_SCOPE_HINT = (
     "文档内的图片没能下载：应用缺少云空间读取权限。"
-    "请在飞书开放平台给应用加上 drive:drive:readonly（或 docs:doc:readonly），"
+    "请在飞书开放平台给应用加上 drive:drive:readonly（或 docs:document.media:download），"
     "发布新版本并等审核通过后重试。正文文字不受影响。"
 )
+
+IMAGE_FORBIDDEN_HINT = (
+    "文档内的图片没能下载：飞书返回 403，应用权限是够的，是这篇文档本身不允许下载素材。"
+    "常见原因是文档「更多设置」里「可复制、打印、下载」限制为「仅可编辑的人」，"
+    "而机器人只有可阅读权限。改法二选一：把机器人的协作者权限提升到「可编辑」，"
+    "或把该设置的范围放宽到「可阅读的人」。正文文字不受影响。"
+)
+
+# 失败提示最多列这么多张图，再多就只给总数，免得灌满卡片和 prompt
+_MAX_LISTED_FAILURES = 5
 
 # 从文件头几个字节判断真实格式，不信任扩展名
 _MAGIC = (
@@ -228,35 +238,43 @@ class DocFetcher:
 
         assets_dir.mkdir(parents=True, exist_ok=True)
         saved: dict[int, Path] = {}
+        failures: list[str] = []
 
         for index, token in enumerate(limited, start=1):
             try:
                 data = await self._api.download_media(token)
             except FeishuApiError as exc:
+                # 这两种拒绝对每张图都一样，没必要再试 N 次，也不该刷 N 条提示
                 if exc.code == SCOPE_DENIED_CODE:
-                    # 缺权限对每张图都一样，没必要再试 N 次
                     notes.append(IMAGE_SCOPE_HINT)
-                    log.warning("图片下载缺少权限，放弃本篇剩余图片：%s", exc)
+                    log.warning("图片下载缺少应用权限，放弃本篇剩余图片：%s", exc)
                     break
-                notes.append(f"图 {index} 下载失败（code={exc.code}: {exc.msg}）。")
+                if exc.http_status == RESOURCE_DENIED_STATUS:
+                    notes.append(IMAGE_FORBIDDEN_HINT)
+                    log.warning("图片下载被文档权限拒绝（403），放弃本篇剩余图片：%s", exc)
+                    break
+                failures.append(f"图 {index}（code={exc.code}）")
                 continue
             except Exception:
                 log.exception("图 %d 下载出现未预期异常", index)
-                notes.append(f"图 {index} 下载失败（内部错误，详情见日志）。")
+                failures.append(f"图 {index}（内部错误）")
                 continue
 
             if not data:
-                notes.append(f"图 {index} 下载到空内容，已跳过。")
+                failures.append(f"图 {index}（内容为空）")
                 continue
             if len(data) > self._cfg.max_image_bytes:
-                notes.append(
-                    f"图 {index} 有 {len(data) // 1024} KB，超过 max_image_bytes，已跳过。"
-                )
+                failures.append(f"图 {index}（{len(data) // 1024} KB，超过上限）")
                 continue
 
             path = assets_dir / f"img-{index:02d}{_image_ext(data)}"
             path.write_bytes(data)
             saved[index] = path
+
+        if failures:
+            listed = "、".join(failures[:_MAX_LISTED_FAILURES])
+            more = f" 等 {len(failures)} 张" if len(failures) > _MAX_LISTED_FAILURES else ""
+            notes.append(f"以下图片下载失败：{listed}{more}。")
 
         if saved:
             log.info("下载图片 %d/%d → %s", len(saved), len(limited), assets_dir)

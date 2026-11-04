@@ -26,13 +26,20 @@ MAX_TEXT_CHARS = 4000
 
 
 class FeishuApiError(Exception):
-    """OpenAPI 返回了非零 code。保留原始 code/msg 以便给出可操作的提示。"""
+    """OpenAPI 调用失败。保留 code/msg/HTTP 状态，以便区分「应用缺权限」和「这个资源不让你碰」。"""
 
-    def __init__(self, code: int | None, msg: str | None, log_id: str | None = None) -> None:
-        super().__init__(f"code={code} msg={msg} log_id={log_id}")
+    def __init__(
+        self,
+        code: int | None,
+        msg: str | None,
+        log_id: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(f"code={code} msg={msg} http={http_status} log_id={log_id}")
         self.code = code
         self.msg = msg or ""
         self.log_id = log_id
+        self.http_status = http_status
 
 
 class FeishuApi:
@@ -167,13 +174,14 @@ class FeishuApi:
         body = getattr(raw, "content", b"") or b""
 
         if status != 200:
+            # 资源级拒绝（如文档安全设置禁止下载）会返回 403 且响应体为空，没有任何 code/msg
             code, msg = _parse_error_body(body)
-            raise FeishuApiError(code, msg, resp.get_log_id())
+            raise FeishuApiError(code, msg, resp.get_log_id(), http_status=status)
 
         content_type = ((getattr(raw, "headers", None) or {}).get("content-type") or "").lower()
         if "application/json" in content_type:
             code, msg = _parse_error_body(body)
-            raise FeishuApiError(code, msg, resp.get_log_id())
+            raise FeishuApiError(code, msg, resp.get_log_id(), http_status=status)
 
         file_obj = getattr(resp, "file", None)
         if file_obj is not None and hasattr(file_obj, "read"):
@@ -244,8 +252,11 @@ def _dumps(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-# 缺少权限时飞书返回这个码，提示语要据此区分「加权限」和「其他错误」
+# 应用没开通所需 scope：HTTP 400 + 这个 code，响应体里会列出可用的 scope 清单
 SCOPE_DENIED_CODE = 99991672
+# 应用 scope 没问题，但这个具体资源不让访问（如文档安全设置禁止下载素材）：
+# HTTP 403 且响应体为空，拿不到任何 code/msg
+RESOURCE_DENIED_STATUS = 403
 
 
 def _parse_error_body(body: bytes) -> tuple[int | None, str]:
