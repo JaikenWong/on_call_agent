@@ -37,9 +37,14 @@ def start_ws_thread(
     main_loop: asyncio.AbstractEventLoop,
     sink: EventSink,
     *,
+    durable: bool = False,
     on_fatal: Callable[[str], None] | None = None,
 ) -> threading.Thread:
     def on_message(data: P2ImMessageReceiveV1) -> None:
+        if durable:
+            # Let the SDK emit failure if the desktop journal cannot commit in time.
+            asyncio.run_coroutine_threadsafe(sink.on_message(data), main_loop).result(timeout=2)
+            return
         try:
             asyncio.run_coroutine_threadsafe(sink.on_message(data), main_loop)
         except Exception:

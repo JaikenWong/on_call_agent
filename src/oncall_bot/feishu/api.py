@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 
 import lark_oapi as lark
 from lark_oapi import AccessTokenType, BaseRequest, HttpMethod
@@ -222,6 +223,7 @@ class FeishuApi:
         body = (
             ReplyMessageRequestBody.builder()
             .content(_dumps(content))
+            .uuid(str(uuid.uuid4()))  # Retries of this same request share one Feishu dedupe ID.
             .msg_type(msg_type)
             .reply_in_thread(in_thread)
             .build()

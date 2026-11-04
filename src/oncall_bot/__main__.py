@@ -10,6 +10,7 @@ import sys
 
 from .app import App
 from .config import ConfigError, load_config
+from .desktop.runtime import instance_lock
 from .feishu.ws import start_ws_thread
 from .logging_setup import setup_logging
 
@@ -70,7 +71,8 @@ def cli(argv: list[str] | None = None) -> int:
     setup_logging(cfg.log_dir, logging.DEBUG if args.debug else logging.INFO)
     app = App(cfg)
     try:
-        code = asyncio.run(_serve(app, cfg.feishu.app_id, cfg.feishu.app_secret))
+        with instance_lock():
+            code = asyncio.run(_serve(app, cfg.feishu.app_id, cfg.feishu.app_secret))
     except KeyboardInterrupt:
         log.info("Ctrl-C 退出")
         return 0
