@@ -6,6 +6,7 @@ import contextlib
 import os
 import stat
 import tempfile
+import uuid
 from pathlib import Path
 
 import pywintypes
@@ -20,7 +21,11 @@ FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # winbase.h; absent in win32con.
 
 
 def attach_job(pid):
-    job = win32job.CreateJobObject(None, None)
+    # pywin32 requires a Unicode job name. Keep each engine-owned job distinct
+    # and prevent children from inheriting the handle that controls its lifetime.
+    security = pywintypes.SECURITY_ATTRIBUTES()
+    security.bInheritHandle = False
+    job = win32job.CreateJobObject(security, f"Local\\OnCallAgent-{uuid.uuid4()}")
     try:
         policy = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
         policy["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
