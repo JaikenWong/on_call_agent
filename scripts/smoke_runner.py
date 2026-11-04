@@ -104,6 +104,17 @@ class FakeApi:
     async def wiki_node(self, token: str) -> tuple[str, str, str]:
         return self.wiki_target
 
+    # ---------- 消息里的图片 ----------
+
+    resource_error: Exception | None = None
+
+    async def download_message_resource(
+        self, message_id: str, file_key: str, resource_type: str = "image"
+    ) -> bytes:
+        if self.resource_error is not None:
+            raise self.resource_error
+        return PNG_BYTES
+
     # ---------- 断言辅助 ----------
 
     @property
@@ -458,6 +469,113 @@ async def run_checks(cfg: Config, session_id: str) -> None:
     # ---------- 9. 后台任务串轮 ----------
     print("\n== 9. 后台任务不串到本轮（回放实测到的真实序列）==")
     await check_turn_stream()
+
+    # ---------- 10. 消息里的图片 ----------
+    print("\n== 10. 飞书消息里的图片 ==")
+    await check_attachments(cfg)
+
+
+async def check_attachments(cfg: Config) -> None:
+    from oncall_bot.attachments import (
+        AttachmentStore,
+        PendingAttachments,
+        ack_text,
+        append_attachments,
+    )
+    from oncall_bot.feishu.api import SCOPE_DENIED_CODE, FeishuApiError
+    from oncall_bot.feishu.parser import extract_content
+
+    # 10.1 解析：纯图片消息 / 图文混排 post / 纯文本
+    parsed = extract_content("image", '{"image_key":"img_v3_abc"}')
+    check("纯图片消息解析出 image_key", parsed == ("", ["img_v3_abc"]), str(parsed))
+
+    post = (
+        '{"title":"需求","content":[['
+        '{"tag":"text","text":"把这个按钮改成蓝色"},'
+        '{"tag":"img","image_key":"img_v3_one"}],'
+        '[{"tag":"img","image_key":"img_v3_two"}]]}'
+    )
+    parsed_post = extract_content("post", post)
+    check("图文混排 post 同时取出文字和两张图",
+          parsed_post is not None
+          and "把这个按钮改成蓝色" in parsed_post[0]
+          and parsed_post[1] == ["img_v3_one", "img_v3_two"],
+          str(parsed_post))
+
+    check("纯文本不受影响", extract_content("text", '{"text":"hi"}') == ("hi", []))
+    check("不支持的类型仍然返回 None", extract_content("audio", '{"file_key":"x"}') is None)
+
+    img_msg = make_msg("")
+    img_msg.image_keys = ["img_v3_abc"]
+    check("纯图片消息能被识别", img_msg.is_image_only)
+    mixed = make_msg("改成蓝色")
+    mixed.image_keys = ["img_v3_abc"]
+    check("图文混排不算纯图片", not mixed.is_image_only)
+
+    # 10.2 下载并保存
+    api = FakeApi()
+    acfg = cfg.attachments.model_copy(
+        update={"dir": cfg.state_file.parent / "attachments"}
+    )
+    store = AttachmentStore(api, acfg)  # type: ignore[arg-type]
+    saved, failures = await store.download_images("om_1", ["k1", "k2"], "sess1234")
+    check("两张图都保存了", len(saved) == 2 and not failures, f"saved={len(saved)}")
+    if saved:
+        check("文件真的落盘", saved[0].path.exists(), str(saved[0].path))
+        check("按文件头判定扩展名为 .png", saved[0].path.suffix == ".png", saved[0].path.name)
+        check("内容是真的 PNG", saved[0].path.read_bytes().startswith(b"\x89PNG"))
+
+    # 10.3 攒着的图片：TTL、上限、领走即清空
+    pending = PendingAttachments(ttl_seconds=600, max_items=2)
+    for image in saved:
+        pending.add(image)
+    check("攒了两张", pending.peek_count() == 2)
+    pending.add(saved[0])
+    check("超过上限时丢弃最旧的", pending.peek_count() == 2)
+    taken = pending.take()
+    check("领走后清空", len(taken) == 2 and pending.peek_count() == 0)
+
+    # 过期判定：用一个「10 分钟前加进来」的条目，TTL 设 60 秒
+    import time as _time
+
+    from oncall_bot.attachments import SavedImage
+
+    stale = PendingAttachments(ttl_seconds=60, max_items=5)
+    stale.add(SavedImage(path=saved[0].path, size=1, added_at=_time.monotonic() - 600))
+    check("超过 TTL 的图片被丢弃", stale.peek_count() == 0, f"count={stale.peek_count()}")
+    fresh = PendingAttachments(ttl_seconds=60, max_items=5)
+    fresh.add(SavedImage(path=saved[0].path, size=1))
+    check("未过期的图片保留", fresh.peek_count() == 1)
+
+    cleared = PendingAttachments(ttl_seconds=600, max_items=5)
+    cleared.add(saved[0])
+    check("clear 返回丢弃数量", cleared.clear("测试") == 1 and cleared.peek_count() == 0)
+
+    # 10.4 prompt 拼接
+    prompt = append_attachments("把按钮改成蓝色", [p.path for p in saved])
+    check("prompt 保留原需求", prompt.startswith("把按钮改成蓝色"))
+    check("prompt 里列出了图片绝对路径", str(saved[0].path) in prompt)
+    check("prompt 让 Claude 用 Read 看图", "Read 工具" in prompt)
+    check("没有图片时 prompt 原样返回", append_attachments("改个标题", []) == "改个标题")
+
+    # 10.5 回执文案
+    ack = ack_text(saved, [], 2)
+    check("回执说明收到几张", "收到 2 张图片" in ack, ack.splitlines()[0])
+    check("回执提示发需求", "把需求发给我" in ack)
+
+    # 10.6 缺 im:resource 权限时的提示
+    api_scope = FakeApi()
+    api_scope.resource_error = FeishuApiError(SCOPE_DENIED_CODE, "Access denied", None)
+    store_scope = AttachmentStore(api_scope, acfg)  # type: ignore[arg-type]
+    saved2, failures2 = await store_scope.download_images("om_2", ["k1", "k2", "k3"], "s")
+    check("缺权限时没有伪造文件", not saved2)
+    check("缺权限只给一条提示（不是每张一条）", len(failures2) == 1, f"failures={len(failures2)}")
+    check("提示点名 im:resource", "im:resource" in failures2[0], failures2[0][:50])
+
+    # 10.7 关掉开关
+    off = AttachmentStore(FakeApi(), acfg.model_copy(update={"enabled": False}))  # type: ignore[arg-type]
+    off_saved, off_failures = await off.download_images("om_3", ["k1"], "s")
+    check("attachments.enabled=false 时不下载", not off_saved and not off_failures)
 
 
 def _build(cls, **kwargs):

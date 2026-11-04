@@ -14,6 +14,7 @@ from lark_oapi import AccessTokenType, BaseRequest, HttpMethod
 from lark_oapi.api.docx.v1 import GetDocumentRequest, RawContentDocumentRequest
 from lark_oapi.api.drive.v1 import DownloadMediaRequest
 from lark_oapi.api.im.v1 import (
+    GetMessageResourceRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
     ReplyMessageRequest,
@@ -169,26 +170,25 @@ class FeishuApi:
         """
         req = DownloadMediaRequest.builder().file_token(file_token).build()
         resp = await self._client.drive.v1.media.adownload(req)
-        raw = getattr(resp, "raw", None)
-        status = getattr(raw, "status_code", None)
-        body = getattr(raw, "content", b"") or b""
+        return _binary_payload(resp, "drive media")
 
-        if status != 200:
-            # 资源级拒绝（如文档安全设置禁止下载）会返回 403 且响应体为空，没有任何 code/msg
-            code, msg = _parse_error_body(body)
-            raise FeishuApiError(code, msg, resp.get_log_id(), http_status=status)
+    async def download_message_resource(
+        self, message_id: str, file_key: str, resource_type: str = "image"
+    ) -> bytes:
+        """下载消息里的图片 / 文件。需要权限 `im:resource`。
 
-        content_type = ((getattr(raw, "headers", None) or {}).get("content-type") or "").lower()
-        if "application/json" in content_type:
-            code, msg = _parse_error_body(body)
-            raise FeishuApiError(code, msg, resp.get_log_id(), http_status=status)
-
-        file_obj = getattr(resp, "file", None)
-        if file_obj is not None and hasattr(file_obj, "read"):
-            data = file_obj.read()
-            if data:
-                return data
-        return body
+        和素材下载一样是二进制接口：成功时 resp.code 是 None、success() 返回 False，
+        必须看 raw.status_code。
+        """
+        req = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type(resource_type)
+            .build()
+        )
+        resp = await self._client.im.v1.message_resource.aget(req)
+        return _binary_payload(resp, f"message_resource {resource_type}")
 
     async def wiki_node(self, token: str) -> tuple[str, str, str | None]:
         """知识库节点 → (obj_type, obj_token, title)。失败抛 FeishuApiError。
@@ -257,6 +257,34 @@ SCOPE_DENIED_CODE = 99991672
 # 应用 scope 没问题，但这个具体资源不让访问（如文档安全设置禁止下载素材）：
 # HTTP 403 且响应体为空，拿不到任何 code/msg
 RESOURCE_DENIED_STATUS = 403
+
+
+def _binary_payload(resp: object, what: str) -> bytes:
+    """二进制下载接口的统一取值。
+
+    这类接口成功时 `resp.code` 是 None、`success()` 返回 False，所以不能用 success() 判断；
+    资源级拒绝会返回 403 且响应体为空，连 code/msg 都没有。
+    """
+    raw = getattr(resp, "raw", None)
+    status = getattr(raw, "status_code", None)
+    body = getattr(raw, "content", b"") or b""
+    log_id = resp.get_log_id() if hasattr(resp, "get_log_id") else None
+
+    if status != 200:
+        code, msg = _parse_error_body(body)
+        raise FeishuApiError(code, msg or f"{what} 下载失败", log_id, http_status=status)
+
+    content_type = ((getattr(raw, "headers", None) or {}).get("content-type") or "").lower()
+    if "application/json" in content_type:
+        code, msg = _parse_error_body(body)
+        raise FeishuApiError(code, msg or f"{what} 返回了 JSON 而不是二进制", log_id, http_status=status)
+
+    file_obj = getattr(resp, "file", None)
+    if file_obj is not None and hasattr(file_obj, "read"):
+        data = file_obj.read()
+        if data:
+            return data
+    return body
 
 
 def _parse_error_body(body: bytes) -> tuple[int | None, str]:

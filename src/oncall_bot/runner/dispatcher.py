@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import Config
 from ..feishu.api import FeishuApi
@@ -78,8 +79,11 @@ class Dispatcher:
 
     # ---------- 提交 / 中断 ----------
 
-    async def submit(self, msg: IncomingMessage) -> SubmitResult:
-        handle = TurnHandle(msg=msg)
+    async def submit(
+        self, msg: IncomingMessage, attachments: list[Path] | None = None
+    ) -> SubmitResult:
+        # 图片在入队时就定下来：排队期间又发了新图，不该混进这一条需求
+        handle = TurnHandle(msg=msg, attachments=list(attachments or []))
         try:
             self._queue.put_nowait(handle)
         except asyncio.QueueFull:

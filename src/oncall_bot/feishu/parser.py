@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -23,10 +23,16 @@ class IncomingMessage:
     sender_open_id: str
     text: str
     mentioned_bot: bool
+    image_keys: list[str] = field(default_factory=list)
 
     @property
     def in_thread(self) -> bool:
         return bool(self.thread_id)
+
+    @property
+    def is_image_only(self) -> bool:
+        """只有图片、没有文字 —— 这种不直接跑一轮，先攒着等后续说明。"""
+        return bool(self.image_keys) and not self.text.strip()
 
 
 @dataclass
@@ -50,8 +56,11 @@ def strip_mentions(text: str) -> str:
     return _MENTION_PLACEHOLDER.sub(" ", text).strip()
 
 
-def extract_text(message_type: str, content_json: str) -> str | None:
-    """从飞书 content（JSON 字符串）里取纯文本。不支持的类型返回 None。"""
+def extract_content(message_type: str, content_json: str) -> tuple[str, list[str]] | None:
+    """从飞书 content（JSON 字符串）里取出 (文本, 图片 key 列表)。
+
+    不支持的消息类型返回 None。纯图片消息返回空文本 + 一个 key。
+    """
     try:
         content: Any = json.loads(content_json or "{}")
     except json.JSONDecodeError:
@@ -59,11 +68,17 @@ def extract_text(message_type: str, content_json: str) -> str | None:
 
     if message_type == "text":
         value = content.get("text")
-        return value if isinstance(value, str) else None
+        return (value, []) if isinstance(value, str) else None
+
+    if message_type == "image":
+        key = content.get("image_key")
+        return ("", [key]) if isinstance(key, str) and key else None
 
     if message_type == "post":
-        # {"title": "...", "content": [[{"tag":"text","text":"..."}, ...], ...]}
+        # {"title": "...", "content": [[{"tag":"text","text":"..."},
+        #                               {"tag":"img","image_key":"..."}], ...]}
         parts: list[str] = []
+        image_keys: list[str] = []
         title = content.get("title")
         if isinstance(title, str) and title.strip():
             parts.append(title.strip())
@@ -72,15 +87,25 @@ def extract_text(message_type: str, content_json: str) -> str | None:
             for line in blocks:
                 if not isinstance(line, list):
                     continue
-                segs = [
-                    seg.get("text", "")
-                    for seg in line
-                    if isinstance(seg, dict) and seg.get("tag") in ("text", "a", "md")
-                ]
-                joined = "".join(s for s in segs if isinstance(s, str))
+                segs: list[str] = []
+                for seg in line:
+                    if not isinstance(seg, dict):
+                        continue
+                    tag = seg.get("tag")
+                    if tag in ("text", "a", "md"):
+                        value = seg.get("text")
+                        if isinstance(value, str):
+                            segs.append(value)
+                    elif tag == "img":
+                        key = seg.get("image_key")
+                        if isinstance(key, str) and key:
+                            image_keys.append(key)
+                joined = "".join(segs)
                 if joined.strip():
                     parts.append(joined.strip())
-        return "\n".join(parts) if parts else None
+        if not parts and not image_keys:
+            return None
+        return ("\n".join(parts), image_keys)
 
     return None
 
@@ -106,8 +131,8 @@ def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
             mentioned_bot = True
             break
 
-    text = extract_text(message_type, message.content or "")
-    if text is None:
+    extracted = extract_content(message_type, message.content or "")
+    if extracted is None:
         raise UnsupportedMessage(
             message_id=message_id,
             chat_id=chat_id,
@@ -117,6 +142,7 @@ def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
             mentioned_bot=mentioned_bot,
             message_type=message_type,
         )
+    text, image_keys = extracted
 
     return IncomingMessage(
         message_id=message_id,
@@ -126,4 +152,5 @@ def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
         sender_open_id=sender_open_id,
         text=strip_mentions(text),
         mentioned_bot=mentioned_bot,
+        image_keys=image_keys,
     )

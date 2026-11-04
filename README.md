@@ -49,6 +49,7 @@ python scripts/smoke_runner.py
    | `im:message:send_as_bot` | 发消息 / 发卡片 |
    | `im:message.p2p_msg:readonly` | **私聊消息（主要用法，必须）** |
    | `im:message.group_at_msg:readonly` | 群里被 @ 的消息（只在群里用才需要）|
+   | `im:resource` | **下载消息里的图片**（开启 `attachments.enabled` 才需要）|
    | `docx:document:readonly` | 读新版云文档正文（开启 `docs.enabled` 才需要）|
    | `wiki:wiki:readonly` | 解析知识库链接（同上）|
    | `drive:drive:readonly` | **下载文档里的图片**（没有这个就只有文字，图片位置会留占位说明）|
@@ -108,6 +109,25 @@ Windows 开机自启：用「任务计划程序」新建任务，触发器选「
 **群聊**：需要 @ 机器人（`policy.require_mention_in_group: true` 时）。
 
 > 私聊没有 @ 这道闸门，意味着**你发的每一句话都会被转给 Claude**，包括「嗯」「好」这种。想随口说话又不触发，就先发 `/stop`，或者换个思路：把闲聊放在别处。命令（`/` 开头）不会转给 Claude。
+
+### 发图片
+
+直接在飞书里把图片发给机器人。**图片不会单独触发一轮**——飞书的图片是独立消息、不能带文字，所以机器人只下载 + 回执：
+
+```
+你：  [一张报错截图]
+机器人：收到 1 张图片（共 84 KB），已存到本机。把需求发给我，我会带着这些图一起看。
+你：  按这个报错改一下
+机器人：[处理中，带了 1 张图片 …]
+```
+
+图片存在 `~/.oncall-bot/attachments/<会话ID前8位>/`，通过 `add_dirs` 授权给 Claude，用 Read 工具看。连发几张再说需求也可以，默认最多攒 9 张、10 分钟内有效（`attachments.max_pending` / `pending_ttl_seconds`）。
+
+富文本消息（图文混排）是一条消息里既有文字又有图，这种直接跑一轮，不用分两步。
+
+`/stop`、`/use`、`/new` 都会清掉攒着的图片——换了上下文，之前的图就不该再跟着跑。`/status` 能看到当前攒了几张。
+
+需要权限 `im:resource`。**还需要你的模型支持视觉**，否则图下载了 Claude 也看不见。
 
 ### 新建会话
 

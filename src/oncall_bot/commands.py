@@ -11,6 +11,7 @@ from pathlib import Path
 
 from claude_agent_sdk import SDKSessionInfo, get_session_info, list_sessions
 
+from .attachments import PendingAttachments
 from .config import Config
 from .feishu.api import FeishuApi
 from .feishu.parser import IncomingMessage
@@ -42,12 +43,18 @@ HELP_TEXT = """可用命令：
 
 class CommandHandler:
     def __init__(
-        self, cfg: Config, api: FeishuApi, state: StateStore, dispatcher: Dispatcher
+        self,
+        cfg: Config,
+        api: FeishuApi,
+        state: StateStore,
+        dispatcher: Dispatcher,
+        pending: PendingAttachments | None = None,
     ) -> None:
         self._cfg = cfg
         self._api = api
         self._state = state
         self._dispatcher = dispatcher
+        self._pending = pending
         self._listing: list[SDKSessionInfo] = []  # 最近一次 /sessions 的结果，序号即下标+1
 
     def is_command(self, text: str) -> bool:
@@ -69,7 +76,11 @@ class CommandHandler:
         elif name == "/status":
             await self._cmd_status(msg)
         elif name == "/stop":
-            await self._reply(msg, await self._dispatcher.stop_current())
+            note = await self._dispatcher.stop_current()
+            dropped = self._clear_pending("/stop")
+            if dropped:
+                note = f"{note} 另外丢弃了攒着的 {dropped} 张图片。"
+            await self._reply(msg, note)
         else:
             await self._reply(msg, f"未知命令 `{name}`。发 /help 看可用命令。")
 
@@ -175,6 +186,8 @@ class CommandHandler:
         )
         # 立刻释放旧连接：桥占着会话时不该让它一直占着，用户可能要去终端里打开它
         await self._dispatcher.connection.close("活跃会话已切换")
+        # 攒着的图片是给上一条会话的上下文准备的，换会话就作废
+        self._clear_pending("切换会话")
         await self._state.set_active(session)
         log.info("活跃会话切换为 %s（%s）", session.short_id, session.workdir)
 
@@ -207,6 +220,7 @@ class CommandHandler:
 
         # 先释放旧连接，避免一边占着老会话一边建新的
         await self._dispatcher.connection.close("新建会话")
+        self._clear_pending("新建会话")
 
         session = ActiveSession(
             session_id=str(uuid.uuid4()),
@@ -319,10 +333,16 @@ class CommandHandler:
         lines.append(f"运行中：{'是' if self._dispatcher.is_running() else '否'}")
         lines.append(f"排队中：{self._dispatcher.queue_size()} 条")
         lines.append(f"Claude 连接：{self._dispatcher.connection.state_text}")
+        if self._pending is not None:
+            waiting = self._pending.peek_count()
+            lines.append(f"攒着的图片：{waiting} 张" + ("（下一条需求会带上）" if waiting else ""))
         lines.append(f"权限模式：{self._cfg.runner.permission_mode}")
         await self._reply(msg, "\n".join(lines))
 
     # ---------- 工具 ----------
+
+    def _clear_pending(self, reason: str) -> int:
+        return self._pending.clear(reason) if self._pending is not None else 0
 
     async def _reply(self, msg: IncomingMessage, text: str) -> None:
         await self._api.reply_text(msg.message_id, text, in_thread=msg.in_thread)

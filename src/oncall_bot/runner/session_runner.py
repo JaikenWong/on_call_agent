@@ -11,6 +11,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -24,6 +25,7 @@ from claude_agent_sdk import (
     get_session_info,
 )
 
+from ..attachments import append_attachments
 from ..config import Config
 from ..docs_fetch import DocFetcher, FetchOutcome, build_prompt, summarize_outcome
 from ..feishu import cards
@@ -52,6 +54,8 @@ class TurnHandle:
     abort_reason: str | None = None
     # 本轮期间后台任务的动态，附在卡片上提醒用户「那些输出不属于本轮回答」
     background_note: str = ""
+    # 入队时领走的待处理图片（飞书里先发图、再说需求）
+    attachments: list[Path] = field(default_factory=list)
 
     async def interrupt(self, reason: str) -> bool:
         if self.client is None:
@@ -146,9 +150,11 @@ class SessionRunner:
 
         # 消息里带飞书云文档链接时，先抓成本地文件，再把路径附在 prompt 后面
         outcome = await self._fetch_docs(msg.text, active)
-        prompt = build_prompt(msg.text, outcome)
+        prompt = append_attachments(build_prompt(msg.text, outcome), handle.attachments)
         if not outcome.empty:
             renderer.add_note(summarize_outcome(outcome))
+        if handle.attachments:
+            renderer.add_note(f"带了 {len(handle.attachments)} 张图片")
 
         try:
             client, created = await self._connection.acquire(active.session_id, options)
@@ -228,10 +234,12 @@ class SessionRunner:
         if runner.system_prompt_append.strip():
             system_prompt["append"] = runner.system_prompt_append
 
-        # inbox 不在仓库里，必须显式授权 Claude 读取
+        # inbox 和图片目录都不在仓库里，必须显式授权 Claude 读取
         add_dirs: list[str] = []
         if self._cfg.docs.enabled:
             add_dirs.append(str(self._cfg.docs.inbox_dir))
+        if self._cfg.attachments.enabled:
+            add_dirs.append(str(self._cfg.attachments.dir))
 
         # /new 建出来的会话还不存在，要用 session_id= 指定新 ID（实测 SDK 会采用这个值）；
         # 已有会话用 resume= 续上。两者互斥。

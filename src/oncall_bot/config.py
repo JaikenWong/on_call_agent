@@ -109,6 +109,25 @@ class DocsConfig(BaseModel):
         return Path(v).expanduser()
 
 
+class AttachmentsConfig(BaseModel):
+    """飞书消息里带的图片：下载到本地，攒着，附在下一条文字需求上交给 Claude。"""
+
+    model_config = ConfigDict(validate_default=True)
+
+    enabled: bool = True
+    dir: Path = Path("~/.oncall-bot/attachments")
+    max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    # 一次最多攒几张，防止有人刷图
+    max_pending: int = Field(default=9, gt=0, le=50)
+    # 攒着的图片超过这么久就作废（图发完了半小时才说需求，大概已经不相关了）
+    pending_ttl_seconds: int = Field(default=600, gt=0)
+
+    @field_validator("dir", mode="after")
+    @classmethod
+    def _expand(cls, v: Path) -> Path:
+        return Path(v).expanduser()
+
+
 class Config(BaseModel):
     # 同上：state_file / log_dir 用默认值时也要展开 "~"
     model_config = ConfigDict(validate_default=True)
@@ -118,6 +137,7 @@ class Config(BaseModel):
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
     docs: DocsConfig = Field(default_factory=DocsConfig)
+    attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
     state_file: Path = Path("~/.oncall-bot/state.json")
     log_dir: Path = Path("~/.oncall-bot/logs")
 
@@ -151,4 +171,6 @@ def load_config(path: str | Path) -> Config:
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     if cfg.docs.enabled:
         cfg.docs.inbox_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.attachments.enabled:
+        cfg.attachments.dir.mkdir(parents=True, exist_ok=True)
     return cfg

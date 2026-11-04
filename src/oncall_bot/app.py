@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .attachments import AttachmentStore, PendingAttachments, ack_text
 from .commands import CommandHandler
 from .config import Config
 from .feishu import cards
 from .feishu.api import FeishuApi
-from .feishu.parser import UnsupportedMessage, parse_message
+from .feishu.parser import IncomingMessage, UnsupportedMessage, parse_message
 from .policy import Deduper
 from .runner.dispatcher import Dispatcher
 from .state import StateStore
@@ -23,7 +24,14 @@ class App:
         self._api = FeishuApi(cfg.feishu.app_id, cfg.feishu.app_secret)
         self._state = StateStore(cfg.state_file)
         self._dispatcher = Dispatcher(cfg, self._api, self._state)
-        self._commands = CommandHandler(cfg, self._api, self._state, self._dispatcher)
+        self._pending = PendingAttachments(
+            ttl_seconds=cfg.attachments.pending_ttl_seconds,
+            max_items=cfg.attachments.max_pending,
+        )
+        self._attachments = AttachmentStore(self._api, cfg.attachments)
+        self._commands = CommandHandler(
+            cfg, self._api, self._state, self._dispatcher, self._pending
+        )
         self._dedupe = Deduper()
         self._bot_open_id = ""
 
@@ -103,6 +111,11 @@ class App:
         )
         log.debug("消息正文：%r", msg.text)
 
+        # 图片先下载。纯图片消息只回执、不跑一轮（飞书里图片是独立消息、不能带文字，
+        # 人的习惯是先发图再说需求），图文混排的 post 消息则正常跑一轮。
+        if msg.image_keys and not await self._handle_images(msg):
+            return
+
         if not msg.text:
             await self._api.reply_text(
                 msg.message_id, "消息是空的。发 /help 看用法。", in_thread=msg.in_thread
@@ -121,9 +134,42 @@ class App:
             )
             return
 
-        result = await self._dispatcher.submit(msg)
+        result = await self._dispatcher.submit(msg, self._pending.take())
         if result.note:
             await self._api.reply_text(msg.message_id, result.note, in_thread=msg.in_thread)
+
+    async def _handle_images(self, msg: IncomingMessage) -> bool:
+        """处理消息里的图片。返回 False 表示本条消息到此为止，不再往下走。"""
+        if not self._cfg.attachments.enabled:
+            await self._api.reply_text(
+                msg.message_id,
+                "图片处理已关闭（配置 attachments.enabled）。请把需求用文字描述。",
+                in_thread=msg.in_thread,
+            )
+            return False
+
+        active = self._state.active
+        saved, failures = await self._attachments.download_images(
+            msg.message_id, msg.image_keys, active.short_id if active else "unbound"
+        )
+        for image in saved:
+            self._pending.add(image)
+
+        if msg.is_image_only:
+            await self._api.reply_text(
+                msg.message_id,
+                ack_text(saved, failures, self._pending.peek_count()),
+                in_thread=msg.in_thread,
+            )
+            return False
+
+        if failures:
+            await self._api.reply_text(
+                msg.message_id,
+                "部分图片没能下载：\n" + "\n".join(f"- {r}" for r in failures),
+                in_thread=msg.in_thread,
+            )
+        return True
 
     def _should_respond(self, chat_type: str, mentioned_bot: bool) -> bool:
         if chat_type != "group":
