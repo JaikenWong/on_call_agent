@@ -218,7 +218,11 @@ class TurnRenderer:
         self._started = time.monotonic()
         self._flusher: asyncio.Task[None] | None = None
         self._closed = False
+        self._finalized = False
         self._final_result: str = ""
+        # 刷新和定稿都发 patch，必须串行：否则一次慢的「处理中」请求可能后到，
+        # 把已经发出的最终卡片覆盖回去，看起来就像永远卡在运行中。
+        self._patch_lock = asyncio.Lock()
 
     # ---------- 输入 ----------
 
@@ -278,12 +282,12 @@ class TurnRenderer:
         try:
             while not self._closed:
                 await asyncio.sleep(interval)
-                if self._dirty:
-                    self._dirty = False
-                    await self._api.patch_card(
-                        self._card_id,
-                        cards.running_card(self._repo, self.body, elapsed_seconds=self.elapsed),
-                    )
+                if not self._dirty or self._closed:
+                    continue
+                self._dirty = False
+                await self._patch(
+                    cards.running_card(self._repo, self.body, elapsed_seconds=self.elapsed)
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -297,4 +301,14 @@ class TurnRenderer:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._flusher
             self._flusher = None
-        await self._api.patch_card(self._card_id, card)
+        await self._patch(card, final=True)
+
+    async def _patch(self, card: dict, *, final: bool = False) -> None:
+        """串行化所有 patch。定稿之后到达的节流刷新一律丢弃，
+        保证最终卡片是这张卡片上的最后一次写入。"""
+        async with self._patch_lock:
+            if self._finalized and not final:
+                return
+            await self._api.patch_card(self._card_id, card)
+            if final:
+                self._finalized = True

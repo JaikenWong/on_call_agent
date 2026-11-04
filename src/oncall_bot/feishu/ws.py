@@ -20,7 +20,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,8 @@ def start_ws_thread(
     app_secret: str,
     main_loop: asyncio.AbstractEventLoop,
     sink: EventSink,
+    *,
+    on_fatal: Callable[[str], None] | None = None,
 ) -> threading.Thread:
     def on_message(data: P2ImMessageReceiveV1) -> None:
         try:
@@ -71,8 +73,16 @@ def start_ws_thread(
                 log_level=lark.LogLevel.WARNING,
                 auto_reconnect=True,
             ).start()
-        except Exception:
+        except Exception as exc:
             log.exception("飞书长连接线程异常退出")
+            if on_fatal is not None:
+                main_loop.call_soon_threadsafe(on_fatal, f"长连接异常退出：{exc}")
+            return
+        # start() 正常返回 = 连接被关闭且不再重连。进程还活着但再也收不到消息，
+        # 什么都不做的话只能靠用户发现「机器人不回话了」。
+        log.error("飞书长连接已结束（未重连），进程将退出以便外部重启")
+        if on_fatal is not None:
+            main_loop.call_soon_threadsafe(on_fatal, "长连接已结束")
 
     thread = threading.Thread(target=run, name="feishu-ws", daemon=True)
     thread.start()

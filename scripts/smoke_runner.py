@@ -750,7 +750,11 @@ async def check_new_session(cfg: Config, state: StateStore) -> None:
     await commands2.handle(make_msg(f"/new {WORKDIR}"))
     check("配了白名单后 /new <路径> 可用", "已新建会话" in api2.texts[-1],
           api2.texts[-1].splitlines()[0])
-    await commands2.handle(make_msg("/new C:/Windows"))
+    # 用一个一定存在、但不在白名单里的目录（跨平台）
+    outside = Path(tempfile.gettempdir())
+    if outside.is_relative_to(Path(WORKDIR).parent):  # 极端情况下临时目录正好在允许根下
+        outside = Path(outside.anchor)
+    await commands2.handle(make_msg(f"/new {outside}"))
     check("白名单之外的目录被拒", "不在 allowed_workdir_roots" in api2.texts[-1],
           api2.texts[-1].splitlines()[0])
     await commands2.handle(make_msg("/new D:/这个目录不存在xyz"))
@@ -921,7 +925,9 @@ async def check_docs(cfg: Config) -> None:
         # 图片
         check("两张图都下载了", doc.images == 2, f"images={doc.images}")
         check("markdown 里有两处图片引用", content.count("![图 ") == 2)
-        check("图片用的是绝对路径", "![图 1](" in content and ":/" in content.split("![图 1](")[1][:5])
+        # 跨平台：Windows 是 C:/..., POSIX 是 /...，只要不是相对路径即可
+        img_ref = content.split("![图 1](")[1].split(")")[0] if "![图 1](" in content else ""
+        check("图片用的是绝对路径", bool(img_ref) and Path(img_ref).is_absolute(), img_ref)
         assets = list(doc.path.parent.glob("*.assets/img-*.png"))
         check("图片文件真的落地了", len(assets) >= 2, f"files={[p.name for p in assets]}")
         if assets:

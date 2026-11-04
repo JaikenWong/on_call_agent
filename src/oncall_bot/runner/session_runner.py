@@ -47,26 +47,48 @@ class TurnHandle:
     """一轮的运行时句柄。dispatcher 持有它，用于 /stop 和超时监控。"""
 
     msg: IncomingMessage
+    # 真正开始执行的时间，run_turn 里重设。不能用入队时间：排队久了会被
+    # 超时监控当成「已经跑了很久」，一轮刚开始就被中断。
     started_at: float = field(default_factory=time.monotonic)
     last_event_at: float = field(default_factory=time.monotonic)
     card_message_id: str | None = None
     client: ClaudeSDKClient | None = None
     abort_reason: str | None = None
+    # 卡片是否已经刷成最终状态。没定稿时保留 last_card，重启后好修正。
+    card_finalized: bool = False
+    _renderer: TurnRenderer | None = field(default=None, repr=False)
     # 本轮期间后台任务的动态，附在卡片上提醒用户「那些输出不属于本轮回答」
     background_note: str = ""
     # 入队时领走的待处理图片（飞书里先发图、再说需求）
     attachments: list[Path] = field(default_factory=list)
+    _interrupt_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _interrupted: bool = field(default=False, repr=False)
 
     async def interrupt(self, reason: str) -> bool:
-        if self.client is None:
-            return False
-        self.abort_reason = reason
+        """幂等：/stop 和超时监控可能同时打进来，只能有一个真正生效。
+
+        连上之前就被中断（client 还是 None）也算成功 —— 这一轮会在
+        acquire 之后、query 之前被丢弃，不会白跑一遍。
+        """
+        async with self._interrupt_lock:
+            if self._interrupted:
+                return True
+            self._interrupted = True
+            self.abort_reason = reason
+            client = self.client
+        if client is None:
+            return True
         try:
-            await self.client.interrupt()
+            await client.interrupt()
         except Exception:
             log.warning("interrupt() 调用失败", exc_info=True)
             return False
         return True
+
+    @property
+    def tag(self) -> str:
+        """日志用的一轮标识，便于把「谁的哪条消息」串起来。"""
+        return f"{self.msg.message_id[:8]}/{self.msg.sender_open_id[:8]}"
 
 
 class SessionRunner:
@@ -81,6 +103,9 @@ class SessionRunner:
 
     async def run_turn(self, handle: TurnHandle) -> None:
         msg = handle.msg
+        # 超时监控从「真正开始跑」起算，排队等待的时间不算在内
+        handle.started_at = time.monotonic()
+        handle.last_event_at = handle.started_at
         active = self._state.active
         if active is None:
             await self._api.reply_text(
@@ -133,12 +158,16 @@ class SessionRunner:
         renderer = TurnRenderer(
             self._api, card_id, active.repo_name, active.short_id, self._cfg.render
         )
+        handle._renderer = renderer
         await renderer.start()
 
         try:
             await self._execute(handle, active, renderer)
         finally:
-            await self._state.set_last_card(None)
+            # 卡片没定稿（进程被中断 / 硬退出前）就留着 last_card，
+            # 下次启动才能把它刷成「状态未知」，而不是永远停在「处理中」。
+            if handle.card_finalized:
+                await self._state.set_last_card(None)
 
     async def _execute(
         self, handle: TurnHandle, active: ActiveSession, renderer: TurnRenderer
@@ -161,6 +190,14 @@ class SessionRunner:
             if created:
                 renderer.replace_status("正在处理…")
             handle.client = client
+
+            # 等待连接期间用户已经 /stop 了：这一轮直接作废，不白跑一次 query
+            if handle.abort_reason:
+                log.info("本轮 %s 在连接建立前已被中断：%s", handle.tag, handle.abort_reason)
+                await self._connection.close("本轮被中断，连接不可复用")
+                await self._finish_aborted(handle, active)
+                return
+
             handle.last_event_at = time.monotonic()
             monitor = asyncio.create_task(self._monitor(handle), name="turn-monitor")
 
@@ -179,13 +216,13 @@ class SessionRunner:
                 log.info("本轮期间的后台任务：%s", handle.background_note)
         except ResultError as exc:
             await self._connection.close("上一轮返回 ResultError")
-            await self._fail(renderer, active, f"Claude 返回错误：`{exc}`", "可以直接发消息继续。")
+            await self._fail(handle, active, f"Claude 返回错误：`{exc}`", "可以直接发消息继续。")
             return
         except ProcessError as exc:
             await self._connection.close("Claude 进程异常退出")
             code = getattr(exc, "exit_code", None)
             await self._fail(
-                renderer,
+                handle,
                 active,
                 f"Claude 进程异常退出（exit={code}）。",
                 "会话历史没有丢，下一条消息会自动续上。",
@@ -194,17 +231,17 @@ class SessionRunner:
         except CLINotFoundError as exc:
             await self._connection.close("找不到 CLI")
             await self._fail(
-                renderer, active, f"找不到 Claude Code CLI：{exc}", "检查配置里的 runner.cli_path。"
+                handle, active, f"找不到 Claude Code CLI：{exc}", "检查配置里的 runner.cli_path。"
             )
             return
         except CLIConnectionError as exc:
             await self._connection.close("连接中断")
-            await self._fail(renderer, active, f"与 Claude Code 的连接中断：{exc}", "请重试。")
+            await self._fail(handle, active, f"与 Claude Code 的连接中断：{exc}", "请重试。")
             return
         except Exception:
             log.exception("单轮执行出现未预期异常")
             await self._connection.close("出现未预期异常")
-            await self._fail(renderer, active, "内部错误，详情见本机日志。", "可以重试。")
+            await self._fail(handle, active, "内部错误，详情见本机日志。", "可以重试。")
             return
         finally:
             handle.client = None
@@ -219,7 +256,7 @@ class SessionRunner:
         if handle.abort_reason:
             await self._connection.close("本轮被中断，连接不可复用")
 
-        await self._finish(handle, active, renderer, result)
+        await self._finish(handle, active, result)
 
     async def _fetch_docs(self, text: str, active: ActiveSession) -> FetchOutcome:
         try:
@@ -269,11 +306,11 @@ class SessionRunner:
             await asyncio.sleep(MONITOR_INTERVAL)
             now = time.monotonic()
             if now - handle.started_at > runner.turn_timeout_seconds:
-                log.warning("单轮总时长超限，中断本轮")
+                log.warning("单轮总时长超限，中断本轮（%s）", handle.tag)
                 await handle.interrupt(f"超时中断（单轮超过 {runner.turn_timeout_seconds}s）")
                 return
             if now - handle.last_event_at > runner.idle_output_timeout_seconds:
-                log.warning("长时间无输出，中断本轮")
+                log.warning("长时间无输出，中断本轮（%s）", handle.tag)
                 await handle.interrupt(
                     f"超时中断（连续 {runner.idle_output_timeout_seconds}s 无输出）"
                 )
@@ -283,13 +320,16 @@ class SessionRunner:
         self,
         handle: TurnHandle,
         active: ActiveSession,
-        renderer: TurnRenderer,
         result: ResultMessage | None,
     ) -> None:
         msg = handle.msg
+        renderer = handle._renderer
+        if renderer is None:
+            log.error("本轮 %s 没有 renderer，无法定稿卡片", handle.tag)
+            return
 
         if result is None:
-            await self._fail(renderer, active, "Claude 没有返回结果消息。", "请重试。")
+            await self._fail(handle, active, "Claude 没有返回结果消息。", "请重试。")
             return
 
         # session_id 核对（实测正常 resume 和指定 session_id 新建时都一致）
@@ -324,19 +364,24 @@ class SessionRunner:
 
         if handle.abort_reason or (result.terminal_reason or "").startswith("aborted"):
             reason = handle.abort_reason or f"已中断（{result.terminal_reason}）"
-            await renderer.finalize(
-                cards.aborted_card(active.repo_name, inline, reason, short_session_id=active.short_id)
+            await self._finalize(
+                handle,
+                cards.aborted_card(
+                    active.repo_name, inline, reason, short_session_id=active.short_id
+                ),
             )
             return
 
         if result.is_error:
             detail = "；".join(result.errors or []) or result.subtype or "未知错误"
-            await renderer.finalize(
-                cards.failed_card(active.repo_name, f"本轮失败：`{detail}`", "可以直接发消息继续。")
+            await self._finalize(
+                handle,
+                cards.failed_card(active.repo_name, f"本轮失败：`{detail}`", "可以直接发消息继续。"),
             )
             return
 
-        await renderer.finalize(
+        await self._finalize(
+            handle,
             cards.done_card(
                 active.repo_name,
                 inline,
@@ -344,17 +389,39 @@ class SessionRunner:
                 num_turns=result.num_turns,
                 tokens=total_tokens(result.usage),
                 short_session_id=active.short_id,
-            )
+            ),
         )
 
         # 结果过长时卡片放摘要，全文用文字消息补发
         if final and len(final) > RESULT_INLINE_MAX:
             await self._api.reply_long_text(msg.message_id, final, in_thread=msg.in_thread)
 
+    async def _finish_aborted(self, handle: TurnHandle, active: ActiveSession) -> None:
+        """连接都还没建立就被中断的收尾。没有模型输出，只有一句原因。"""
+        reason = handle.abort_reason or "已中断"
+        await self._finalize(
+            handle,
+            cards.aborted_card(
+                active.repo_name, "", reason, short_session_id=active.short_id
+            ),
+        )
+
     async def _fail(
-        self, renderer: TurnRenderer, active: ActiveSession, reason: str, next_step: str
+        self, handle: TurnHandle, active: ActiveSession, reason: str, next_step: str
     ) -> None:
-        await renderer.finalize(cards.failed_card(active.repo_name, reason, next_step))
+        await self._finalize(handle, cards.failed_card(active.repo_name, reason, next_step))
+
+    async def _finalize(self, handle: TurnHandle, card: dict) -> None:
+        """先把卡片刷成最终状态，再标记定稿。
+
+        顺序不能反：反过来一旦 patch 卡住或进程退出，handle 会被当成已定稿，
+        last_card 被清掉，那张卡片就永远停在「处理中」了。
+        """
+        renderer = handle._renderer
+        if renderer is None:
+            return
+        await renderer.finalize(card)
+        handle.card_finalized = True
 
 
 def _log_stderr(line: str) -> None:

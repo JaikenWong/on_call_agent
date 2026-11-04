@@ -23,15 +23,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def _serve(app: App, app_id: str, app_secret: str) -> None:
+async def _serve(app: App, app_id: str, app_secret: str) -> int:
     await app.startup()
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
+    exit_code = 0
 
     def request_stop() -> None:
         log.info("收到退出信号")
         stop.set()
+
+    def _fatal(reason: str, event: asyncio.Event) -> None:
+        """长连接不可恢复地断掉：进程留着也收不到消息，交给外部守护进程重启。"""
+        nonlocal exit_code
+        log.error("致命错误，准备退出：%s", reason)
+        exit_code = 1
+        event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -40,7 +48,7 @@ async def _serve(app: App, app_id: str, app_secret: str) -> None:
             # Windows 的 Proactor 循环不支持 add_signal_handler，交给 KeyboardInterrupt
             signal.signal(sig, lambda *_: request_stop())
 
-    start_ws_thread(app_id, app_secret, loop, app)
+    start_ws_thread(app_id, app_secret, loop, app, on_fatal=lambda reason: _fatal(reason, stop))
     log.info("已就绪。在飞书里 @ 机器人发 /help 看命令。")
 
     try:
@@ -48,6 +56,7 @@ async def _serve(app: App, app_id: str, app_secret: str) -> None:
     finally:
         await app.shutdown()
         log.info("已退出")
+    return exit_code
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -61,13 +70,14 @@ def cli(argv: list[str] | None = None) -> int:
     setup_logging(cfg.log_dir, logging.DEBUG if args.debug else logging.INFO)
     app = App(cfg)
     try:
-        asyncio.run(_serve(app, cfg.feishu.app_id, cfg.feishu.app_secret))
+        code = asyncio.run(_serve(app, cfg.feishu.app_id, cfg.feishu.app_secret))
     except KeyboardInterrupt:
         log.info("Ctrl-C 退出")
+        return 0
     except Exception:
         log.exception("启动失败")
         return 1
-    return 0
+    return code
 
 
 if __name__ == "__main__":

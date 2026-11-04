@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -101,7 +103,10 @@ class AttachmentStore:
 
         target = self._cfg.dir / (subdir or "unbound")
         target.mkdir(parents=True, exist_ok=True)
+        # 文件名要带 message_id：只用时间戳时，同一秒内的两条消息（同一个人的两连发，
+        # 或者两个人各自发图）会撞名，后写的直接覆盖先写的。
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        unique = re.sub(r"[^0-9A-Za-z_-]", "", message_id)[-16:] or uuid.uuid4().hex[:8]
 
         saved: list[SavedImage] = []
         failures: list[str] = []
@@ -132,7 +137,7 @@ class AttachmentStore:
                 failures.append(f"第 {index} 张有 {len(data) // 1024} KB，超过上限")
                 continue
 
-            path = target / f"{stamp}-{index:02d}{_image_ext(data)}"
+            path = target / f"{stamp}-{unique}-{index:02d}{_image_ext(data)}"
             try:
                 path.write_bytes(data)
             except OSError as exc:

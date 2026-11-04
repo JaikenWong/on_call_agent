@@ -104,8 +104,10 @@ class App:
 
         # 这行是第一次配置时拿自己 open_id 的办法：白名单留空启动一次，发条消息看这里
         log.info(
-            "收到消息 chat_type=%s sender_open_id=%s 长度=%d",
+            "收到消息 message_id=%s chat_type=%s chat_id=%s sender_open_id=%s 长度=%d",
+            msg.message_id,
             msg.chat_type,
+            msg.chat_id,
             msg.sender_open_id,
             len(msg.text),
         )
@@ -130,6 +132,15 @@ class App:
             await self._api.reply_text(
                 msg.message_id,
                 "还没有选择会话。发 /sessions 看列表，再 /use <序号>。",
+                in_thread=msg.in_thread,
+            )
+            return
+
+        if not self._dispatcher.has_room():
+            await self._api.reply_text(
+                msg.message_id,
+                f"队列已满（{self._cfg.runner.max_queue} 条），请等当前任务跑完再发。"
+                "攒着的图片会留着，下一条成功的需求会带上。",
                 in_thread=msg.in_thread,
             )
             return
