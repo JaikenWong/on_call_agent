@@ -224,6 +224,7 @@ src/oncall_bot/
 │  └─ parser.py       事件 → IncomingMessage
 └─ runner/
    ├─ connection.py   跨轮复用的 Claude 连接
+   ├─ turn_stream.py  区分本轮消息与后台任务消息
    ├─ dispatcher.py   单队列 + worker + /stop + 空闲断连
    ├─ session_runner.py  用 ClaudeSDKClient resume 跑一轮
    └─ render.py       SDK 消息 → 卡片正文 + 节流更新

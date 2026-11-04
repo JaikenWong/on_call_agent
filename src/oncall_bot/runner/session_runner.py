@@ -32,6 +32,7 @@ from ..feishu.parser import IncomingMessage
 from ..state import ActiveSession, CardRef, StateStore
 from .connection import SessionConnection
 from .render import TurnRenderer, clip_tail, to_feishu_markdown, total_tokens
+from .turn_stream import TurnStream
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ class TurnHandle:
     card_message_id: str | None = None
     client: ClaudeSDKClient | None = None
     abort_reason: str | None = None
+    # 本轮期间后台任务的动态，附在卡片上提醒用户「那些输出不属于本轮回答」
+    background_note: str = ""
 
     async def interrupt(self, reason: str) -> bool:
         if self.client is None:
@@ -156,12 +159,18 @@ class SessionRunner:
             monitor = asyncio.create_task(self._monitor(handle), name="turn-monitor")
 
             await client.query(prompt)
-            # 中断后不要 break：必须把流读完才能拿到 ResultMessage。
-            async for message in client.receive_response():
+            # 不能用 receive_response()：它遇到第一个 ResultMessage 就收尾，
+            # 长连接下那很可能是上一轮后台任务的结果。详见 turn_stream.py
+            stream = TurnStream()
+            # 中断后也不要 break：必须读到本轮的 ResultMessage。
+            async for message in stream.iterate(client.receive_messages()):
                 handle.last_event_at = time.monotonic()
                 renderer.feed(message)
                 if isinstance(message, ResultMessage):
                     result = message
+            handle.background_note = stream.summary_note()
+            if handle.background_note:
+                log.info("本轮期间的后台任务：%s", handle.background_note)
         except ResultError as exc:
             await self._connection.close("上一轮返回 ResultError")
             await self._fail(renderer, active, f"Claude 返回错误：`{exc}`", "可以直接发消息继续。")
@@ -302,6 +311,8 @@ class SessionRunner:
             if final and len(final) <= RESULT_INLINE_MAX
             else body
         )
+        if handle.background_note:
+            inline = f"*{handle.background_note}*\n\n{inline}"
 
         if handle.abort_reason or (result.terminal_reason or "").startswith("aborted"):
             reason = handle.abort_reason or f"已中断（{result.terminal_reason}）"

@@ -88,7 +88,39 @@
 
 第 3 条还有个副作用：中断后的 `terminal_reason` 不是 `aborted_*`，所以判断「本轮是否被中断」要以自己记录的 `handle.abort_reason` 为准，不能只看 `terminal_reason`。
 
-### 2.5 本机模型与认证的真实情况（与旧版文档不同）
+### 2.5 `receive_response()` 在长连接下会串轮 —— 必须自己做关联
+
+**这是长连接改造引入的回归，线上真实踩到过**：用户让它推代码，卡片回的却是上一轮后台轮询的结果；下一条消息（「我看过了」）才拿到推代码的结果。
+
+根因在 `receive_response()` 的实现 —— 它就是 `receive_messages()` 加一句「遇到**第一个** `ResultMessage` 就 return」，**没有任何轮次关联**：
+
+```python
+async for message in self.receive_messages():
+    yield message
+    if isinstance(message, ResultMessage):
+        return
+```
+
+Claude 自己起的后台任务会在**轮外**产出消息，其中包括它自己的 `ResultMessage`。长连接下这些消息留在流里，下一轮一 `query()` 就立刻读到它，于是：本轮答案 = 上一轮后台任务的输出，本轮的真实结果被推迟一轮。旧的「每轮新建 client」不会有这个问题，因为残留随进程一起丢掉了。
+
+实测抓到的真实序列（一次 `query()` 之后收到**两个** `ResultMessage`）：
+
+| 顺序 | `origin` | `num_turns` | `result` | 归属 |
+|------|----------|-------------|----------|------|
+| 1 | `{'kind': 'task-notification', 'producer': 'session-task', ...}` | 3 | 已启动第二条 | 上一轮后台任务 |
+| 2 | `None` | 1 | 好 | **本轮** |
+
+所以判据是 `origin`：
+
+- `origin` 为 `None` 或 `kind == 'human'` → 本轮的结果，**只有它能终止本轮**
+- 其余 `kind`（`task-notification` / `channel` / `peer` / `coordinator` / `observer` / `auto-continuation` …）→ 不是终止条件
+
+两个实现细节：
+
+- `MessageOrigin` 是 **TypedDict**，实际拿到的是 `dict`，要用 `origin.get("kind")` 而不是属性访问。
+- `AssistantMessage` **没有** `origin` 字段，所以后台链里的助手文本无法靠 origin 过滤。用一个开关：遇到 `Task*Message` 置位、遇到任意 `ResultMessage` 复位，期间的内容不进本轮正文。复位条件放宽到「任意 ResultMessage」是为了防卡死 —— 后台链万一不收尾，本轮的 `ResultMessage` 照样能终止。
+
+### 2.6 本机模型与认证的真实情况（与旧版文档不同）
 
 `~/.claude/settings.json` 的 `env` 段把 Claude Code 指向了第三方网关：
 
@@ -105,11 +137,11 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL = deepseek-v4-pro[1m]
 2. **不要在卡片上显示费用。** `total_cost_usd` 是按 Anthropic 价目表估的（三个字的回复报 $0.077），和实际计费无关。改显示耗时 + token 数。同理 `max_budget_usd` 不是真闸门，默认不设。
 3. **stderr 上会持续出现噪音**：`[claude-code:unrecognized_model]`、`claude.ai connectors are disabled…`。渲染层只能把 stderr 写日志，**不得**当错误贴到卡片上。
 
-### 2.6 旧版文档的一处错误
+### 2.7 旧版文档的一处错误
 
 旧文档第 11.3 节称「SDK 默认会加载目标仓库的 `.claude/` 配置」——**说反了**。Agent SDK 默认不加载任何 setting source，必须显式传 `setting_sources=["project"]` 才会加载仓库的 hooks / MCP / skills。本方案默认传 `["user", "project"]`（与终端里 `claude` 的行为一致），并在配置里给出开关。
 
-### 2.7 飞书 SDK 可用面
+### 2.8 飞书 SDK 可用面
 
 - `lark.ws.Client(app_id, app_secret, log_level=…, event_handler=…, auto_reconnect=True)`
 - `lark.EventDispatcherHandler.builder("", "")` 上有 `register_p2_im_message_receive_v1`、`register_p2_card_action_trigger`
@@ -123,7 +155,7 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL = deepseek-v4-pro[1m]
 - 原生请求取机器人 open_id：`BaseRequest.builder().http_method(HttpMethod.GET).uri("/open-apis/bot/v3/info").token_types({AccessTokenType.TENANT}).build()` → `client.arequest(req)` → `json.loads(resp.raw.content)`
 - `BaseRequest` builder 字段：`http_method` `uri` `token_types` `paths`(dict) `queries`(list[tuple[str,str]]) `headers` `body`
 
-### 2.8 云文档相关可用面（实测确认）
+### 2.9 云文档相关可用面（实测确认）
 
 | 能力 | 接口 | 形状 |
 |------|------|------|
@@ -225,6 +257,7 @@ on_call_bot/
 │  │  └─ parser.py                # 事件 → IncomingMessage
 │  └─ runner/
 │     ├─ connection.py            # 跨轮复用的 Claude 连接
+│     ├─ turn_stream.py           # 区分本轮消息与后台任务消息
 │     ├─ dispatcher.py            # 单队列 + worker + /stop + 空闲断连
 │     ├─ session_runner.py        # 跑一轮
 │     └─ render.py                # SDK 消息 → 卡片文本 + 节流
@@ -405,7 +438,7 @@ class IncomingMessage:
 
 - `message.content` 是 JSON 串：`text` 取 `{"text":…}`；`post` 拼接文本段；其余返回 `None`。
 - 删除 `@_user_1` 之类占位符；`mentioned_bot` 用 `mentions[*].id.open_id == bot_open_id` 判断。
-- 启动时取机器人 open_id（见 2.7 原生请求写法）并缓存。
+- 启动时取机器人 open_id（见 2.8 原生请求写法）并缓存。
 
 ### 8.3 发送（`api.py`）
 
@@ -426,7 +459,7 @@ class IncomingMessage:
 | 卡片 | 内容 |
 |------|------|
 | 运行中 | 标题「处理中 · <仓库名>」；正文累计文本 + 工具调用摘要行；底部「发送 /stop 可中断」 |
-| 完成 | 标题「完成」；正文最终结果；底部耗时、轮数、token 数、会话 ID 前 8 位（**不显示费用**，见 2.5） |
+| 完成 | 标题「完成」；正文最终结果；底部耗时、轮数、token 数、会话 ID 前 8 位（**不显示费用**，见 2.6） |
 | 失败 | 标题「失败」；原因 + 下一步建议 |
 
 ### 8.5 飞书卡片的 markdown 支持（实测，`scripts/check_card_markdown.py`）
@@ -522,7 +555,11 @@ prompt = build_prompt(msg.text, outcome)
 client, created = await connection.acquire(active.session_id, options)
 handle.client = client
 await client.query(prompt)
-async for m in client.receive_response():     # 不要 break
+
+# 不能用 receive_response()：它遇到第一个 ResultMessage 就收尾，长连接下
+# 那可能是上一轮后台任务的结果。必须自己按 origin 做关联，见 2.5
+stream = TurnStream()
+async for m in stream.iterate(client.receive_messages()):   # 不要 break
     handle.last_event_at = time.monotonic()
     renderer.feed(m)
 
@@ -579,7 +616,7 @@ if handle.abort_reason:
 
 - 图片写到 md 同目录的 `<文档名>-<token8>.assets/img-NN.<ext>`，扩展名按**文件头魔术字节**判断，不信任接口。
 - markdown 里用 `![图 N](C:/绝对/路径.png)`（正斜杠），既是合法 markdown 也能直接喂给 Read 工具。文件头和 prompt 里都说明「需要看图时用 Read 读这个文件」。
-- 遇到 `99991672`（应用缺 scope）或 HTTP 403（文档不允许下载素材）立刻停止本篇剩余图片，并给出对应的、可操作的改法。两种原因的提示必须不同，见 2.8。
+- 遇到 `99991672`（应用缺 scope）或 HTTP 403（文档不允许下载素材）立刻停止本篇剩余图片，并给出对应的、可操作的改法。两种原因的提示必须不同，见 2.9。
 - 其余零散失败折叠成一条提示，最多列 5 张图再给总数。
 - 下载不到的图片在正文原位留「（图 N 未能下载，原因见本文件开头的说明）」，**不留空、不静默跳过**。
 
@@ -665,7 +702,8 @@ M0–M5 已完成。
 - [ ] `/stop` 能停，之后能继续
 - [ ] 会话文件被删后发消息明确报错，**没有**偷开新会话
 - [ ] 重启桥后活跃会话还在；上一张「处理中」卡片被刷成「状态未知」
-- [ ] 卡片上没有费用数字（2.5）
+- [ ] 卡片上没有费用数字（2.6）
+- [ ] 让它起一个后台任务（比如「后台轮询某个 URL，起来了告诉我」），下一条消息问**别的事**，卡片回的必须是新问题的答案，不是后台任务的输出（2.5）
 - [ ] stderr 噪音没有被当成错误贴到卡片上
 - [ ] 回复里的代码块在卡片上渲染成灰底框（不是裸的 ```），列表有样式，标题变成加粗
 - [ ] 贴 docx 链接后 Claude 确实读到了内容（回复里引用了文档里的具体内容）

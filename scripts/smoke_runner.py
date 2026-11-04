@@ -455,6 +455,141 @@ async def run_checks(cfg: Config, session_id: str) -> None:
     print("\n== 8. /new 新建会话 ==")
     await check_new_session(cfg, state)
 
+    # ---------- 9. 后台任务串轮 ----------
+    print("\n== 9. 后台任务不串到本轮（回放实测到的真实序列）==")
+    await check_turn_stream()
+
+
+def _build(cls, **kwargs):
+    """按 dataclass 必填字段补空值，构造测试用消息对象。"""
+    import dataclasses
+
+    values = {}
+    for f in dataclasses.fields(cls):
+        if f.name in kwargs:
+            values[f.name] = kwargs[f.name]
+            continue
+        if f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING:
+            continue
+        hint = str(f.type)
+        if "bool" in hint:
+            values[f.name] = False
+        elif "int" in hint:
+            values[f.name] = 0
+        elif "str" in hint and "None" not in hint:
+            values[f.name] = ""
+        elif "list" in hint:
+            values[f.name] = []
+        elif "dict" in hint:
+            values[f.name] = {}
+        else:
+            values[f.name] = None
+    return cls(**values)
+
+
+async def check_turn_stream() -> None:
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        SystemMessage,
+        TaskNotificationMessage,
+        TaskStartedMessage,
+        TaskUpdatedMessage,
+        TextBlock,
+    )
+
+    from oncall_bot.runner.turn_stream import TurnStream, is_turn_result, origin_kind
+
+    def assistant(text: str):
+        return _build(AssistantMessage, content=[TextBlock(text=text)])
+
+    def result(origin, text: str, turns: int):
+        return _build(
+            ResultMessage,
+            subtype="success",
+            is_error=False,
+            num_turns=turns,
+            session_id="s",
+            result=text,
+            origin=origin,
+        )
+
+    # 这就是实测抓到的顺序：上一轮后台任务的残留先到，本轮的答案在后面
+    sequence = [
+        _build(TaskUpdatedMessage, subtype="task_updated", task_id="bt7to7lse", status="completed"),
+        _build(
+            TaskNotificationMessage,
+            subtype="task_notification",
+            task_id="bt7to7lse",
+            status="completed",
+        ),
+        _build(SystemMessage, subtype="background_tasks_changed", data={}),
+        _build(SystemMessage, subtype="init", data={}),
+        assistant("后台任务的废话，不该出现在本轮回答里"),
+        _build(TaskStartedMessage, subtype="task_started", task_id="bkvf3336r"),
+        assistant("已启动第二条"),
+        result({"kind": "task-notification", "producer": "session-task"}, "已启动第二条", 3),
+        _build(SystemMessage, subtype="init", data={}),
+        assistant("好"),
+        result(None, "好", 1),
+    ]
+
+    async def feed():
+        for m in sequence:
+            yield m
+
+    # 单元判据
+    check("origin 是 dict 时能取到 kind",
+          origin_kind(result({"kind": "task-notification"}, "x", 1)) == "task-notification")
+    check("origin=None 的 ResultMessage 算本轮", is_turn_result(result(None, "x", 1)))
+    check("task-notification 的 ResultMessage 不算本轮",
+          not is_turn_result(result({"kind": "task-notification"}, "x", 1)))
+
+    stream = TurnStream()
+    yielded = [m async for m in stream.iterate(feed())]
+
+    results = [m for m in yielded if isinstance(m, ResultMessage)]
+    check("只产出一个 ResultMessage", len(results) == 1, f"got={len(results)}")
+    check("产出的是本轮那个（origin=None、num_turns=1）",
+          bool(results) and results[0].num_turns == 1 and results[0].result == "好",
+          f"num_turns={results[0].num_turns if results else '-'}")
+    check("在本轮结果处就停止，没有多读",
+          yielded[-1] is sequence[-1], type(yielded[-1]).__name__)
+
+    texts = "".join(
+        b.text for m in yielded if isinstance(m, AssistantMessage) for b in m.content
+        if hasattr(b, "text")
+    )
+    check("本轮正文只有「好」", texts == "好", repr(texts))
+    check("后台任务的助手文本被挡掉", "废话" not in texts and "已启动第二条" not in texts)
+
+    check("后台任务被记录下来", len(stream.background) >= 2, f"events={len(stream.background)}")
+    note = stream.summary_note()
+    check("给出了后台任务提示", "后台任务完成" in note, note)
+    check("提示里点明不属于本轮回答", "不属于本轮" in note, note)
+
+    # 没有后台任务时不该有任何提示
+    async def plain():
+        yield assistant("普通回答")
+        yield result(None, "普通回答", 1)
+
+    stream2 = TurnStream()
+    plain_yielded = [m async for m in stream2.iterate(plain())]
+    check("无后台任务时正常收尾", len(plain_yielded) == 2 and stream2.saw_turn_result)
+    check("无后台任务时没有提示", stream2.summary_note() == "", stream2.summary_note())
+
+    # 后台链一直不收尾时，本轮结果照样能终止（防卡死）
+    async def unterminated():
+        yield _build(TaskStartedMessage, subtype="task_started", task_id="bt-x")
+        yield assistant("后台的")
+        yield result(None, "本轮答案", 1)
+
+    stream3 = TurnStream()
+    out3 = [m async for m in stream3.iterate(unterminated())]
+    check("后台链不收尾也不会卡住本轮",
+          stream3.saw_turn_result and isinstance(out3[-1], ResultMessage),
+          f"yielded={len(out3)}")
+
 
 async def check_new_session(cfg: Config, state: StateStore) -> None:
     from claude_agent_sdk import delete_session, get_session_info
