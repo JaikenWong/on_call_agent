@@ -451,6 +451,103 @@ async def run_checks(cfg: Config, session_id: str) -> None:
     print("\n== 7. 飞书 markdown 转换 ==")
     check_markdown()
 
+    # ---------- 8. /new 新建会话 ----------
+    print("\n== 8. /new 新建会话 ==")
+    await check_new_session(cfg, state)
+
+
+async def check_new_session(cfg: Config, state: StateStore) -> None:
+    from claude_agent_sdk import delete_session, get_session_info
+
+    api = FakeApi()
+    conn = SessionConnection(cfg.runner.connection_idle_seconds)
+    dispatcher = Dispatcher(cfg, api, state)  # type: ignore[arg-type]
+    commands = CommandHandler(cfg, api, state, dispatcher)  # type: ignore[arg-type]
+
+    # 8.1 路径参数在没配白名单时必须被拒
+    await commands.handle(make_msg(f"/new {WORKDIR}"))
+    check("未配白名单时 /new <路径> 被拒且说明怎么配",
+          "allowed_workdir_roots" in api.texts[-1] and "安全" in api.texts[-1],
+          api.texts[-1].splitlines()[0])
+
+    # 8.2 不带参数：沿用当前会话的仓库
+    before_id = state.active.session_id if state.active else ""
+    await commands.handle(make_msg("/new"))
+    reply = api.texts[-1]
+    check("/new 成功新建", "已新建会话" in reply, reply.splitlines()[0])
+    new_active = state.active
+    check("活跃会话换成了新 ID", new_active is not None and new_active.session_id != before_id)
+    check("带上了 pending 标记", new_active is not None and new_active.pending_create)
+    check("仓库沿用当前会话", new_active is not None and new_active.workdir == WORKDIR,
+          new_active.workdir if new_active else "")
+    check("新会话此刻还没有落盘",
+          new_active is not None and get_session_info(new_active.session_id, WORKDIR) is None)
+
+    new_id = new_active.session_id if new_active else ""
+
+    # 8.3 /status 要标出 pending
+    await commands.handle(make_msg("/status"))
+    check("/status 标出尚未落盘", "尚未落盘" in api.texts[-1], api.texts[-1].splitlines()[0])
+
+    # 8.4 配了白名单之后路径参数可用，越界仍然被拒
+    cfg_roots = cfg.model_copy(deep=True)
+    cfg_roots.policy.allowed_workdir_roots = [Path(WORKDIR).parent]
+    api2 = FakeApi()
+    commands2 = CommandHandler(cfg_roots, api2, state, dispatcher)  # type: ignore[arg-type]
+    await commands2.handle(make_msg(f"/new {WORKDIR}"))
+    check("配了白名单后 /new <路径> 可用", "已新建会话" in api2.texts[-1],
+          api2.texts[-1].splitlines()[0])
+    await commands2.handle(make_msg("/new C:/Windows"))
+    check("白名单之外的目录被拒", "不在 allowed_workdir_roots" in api2.texts[-1],
+          api2.texts[-1].splitlines()[0])
+    await commands2.handle(make_msg("/new D:/这个目录不存在xyz"))
+    check("不存在的目录被拒", "不存在或不是目录" in api2.texts[-1], api2.texts[-1])
+
+    # 回到 8.2 建的那条，真跑一轮把它创建出来
+    created = state.active
+    if created is None or not created.pending_create:
+        check("pending 会话仍在（准备跑第一轮）", False, "状态被后续命令改了")
+        return
+    new_id = created.session_id
+
+    print("  → 跑第一轮，真正创建这条会话")
+    api3 = FakeApi()
+    runner = SessionRunner(cfg, api3, state, conn)  # type: ignore[arg-type]
+    await runner.run_turn(TurnHandle(msg=make_msg("请记住口令：白鹭十三号。只回复「已记住」。")))
+
+    try:
+        check("第一轮卡片提示在新建会话",
+              bool(api3.cards) and "新建会话" in api3.card_body(api3.cards[0]),
+              api3.card_body(api3.cards[0]) if api3.cards else "")
+        check("第一轮完成", api3.card_title(api3.last_patch).startswith("完成"),
+              api3.card_title(api3.last_patch))
+
+        info = get_session_info(new_id, WORKDIR)
+        check("会话文件已按指定 ID 落盘", info is not None, f"id={new_id[:8]}")
+        check("落盘的工作目录正确",
+              info is not None and Path(info.cwd or "").resolve() == Path(WORKDIR).resolve(),
+              info.cwd if info else "")
+        check("pending 标记已清除",
+              state.active is not None and not state.active.pending_create)
+        check("标题已换成 Claude 生成的摘要",
+              state.active is not None and "尚未开始" not in state.active.title,
+              state.active.title if state.active else "")
+
+        # 第二轮：应该走 resume，上下文延续
+        api4 = FakeApi()
+        runner2 = SessionRunner(cfg, api4, state, conn)  # type: ignore[arg-type]
+        await runner2.run_turn(TurnHandle(msg=make_msg("刚才的口令是什么？只答口令。")))
+        check("新会话的上下文能延续", "白鹭十三号" in api4.card_body(api4.last_patch),
+              api4.card_body(api4.last_patch)[:60])
+        check("第二轮 session_id 没变",
+              state.active is not None and state.active.session_id == new_id)
+    finally:
+        await conn.close("8 段结束")
+        await dispatcher.shutdown()
+        if get_session_info(new_id, WORKDIR) is not None:
+            delete_session(new_id, directory=WORKDIR)
+            print(f"  已清理新建的会话 {new_id[:8]}")
+
 
 def check_markdown() -> None:
     from oncall_bot.feishu import cards

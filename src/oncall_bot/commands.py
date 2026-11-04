@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,8 @@ HELP_TEXT = """可用命令：
 /sessions — 列出本机最近的 Claude Code 会话
 /use <序号|会话ID> — 切换到某条会话。序号来自最近一次 /sessions；
                      会话 ID 可以是列表里显示的前 8 位，只要能唯一匹配
+/new — 在当前会话的同一个仓库下新建一条会话（新需求用这个，上下文从零开始）
+/new <路径> — 在指定仓库下新建。需要先在配置里设 policy.allowed_workdir_roots
 /status — 当前会话、运行状态、队列长度
 /stop — 中断当前任务并清空队列
 /help — 这段说明
@@ -61,6 +64,8 @@ class CommandHandler:
             await self._cmd_sessions(msg)
         elif name == "/use":
             await self._cmd_use(msg, args)
+        elif name == "/new":
+            await self._cmd_new(msg, args)
         elif name == "/status":
             await self._cmd_status(msg)
         elif name == "/stop":
@@ -188,6 +193,85 @@ class CommandHandler:
             ),
         )
 
+    # ---------- /new ----------
+
+    async def _cmd_new(self, msg: IncomingMessage, args: list[str]) -> None:
+        if self._dispatcher.is_running():
+            await self._reply(msg, "当前有任务在跑，新建会话前请先 /stop。")
+            return
+
+        workdir, error = self._resolve_new_workdir(args)
+        if workdir is None:
+            await self._reply(msg, error)
+            return
+
+        # 先释放旧连接，避免一边占着老会话一边建新的
+        await self._dispatcher.connection.close("新建会话")
+
+        session = ActiveSession(
+            session_id=str(uuid.uuid4()),
+            workdir=str(workdir),
+            title="（新会话，尚未开始）",
+            switched_by=msg.sender_open_id,
+            switched_at=now_iso(),
+            pending_create=True,
+        )
+        await self._state.set_active(session)
+        log.info("已新建会话 %s（%s），等待第一条消息", session.short_id, session.workdir)
+
+        await self._reply(
+            msg,
+            "\n".join(
+                [
+                    "已新建会话并切过去：",
+                    f"  会话：{session.short_id}（全新，没有任何上下文）",
+                    f"  仓库：{session.workdir}",
+                    "",
+                    "直接把需求发给我就行。会话文件会在第一轮跑完后落盘，",
+                    "在那之前这条会话还不会出现在 /sessions 列表里。",
+                ]
+            ),
+        )
+
+    def _resolve_new_workdir(self, args: list[str]) -> tuple[Path | None, str]:
+        """返回 (目录, 错误提示)。目录为 None 时错误提示非空。"""
+        if not args:
+            active = self._state.active
+            if active is None:
+                return None, (
+                    "当前没有活跃会话，/new 不知道该用哪个仓库。\n"
+                    "要么先 /sessions + /use 选一条会话，要么用 /new <仓库路径>"
+                    "（需要先在配置里设 policy.allowed_workdir_roots）。"
+                )
+            workdir = Path(active.workdir)
+            if not workdir.is_dir():
+                return None, f"当前会话的仓库目录已不存在：{active.workdir}"
+            return workdir, ""
+
+        roots = self._cfg.policy.allowed_workdir_roots
+        if not roots:
+            return None, (
+                "为安全起见，/new 默认不接受路径参数 —— 否则等于让飞书上的人"
+                "在本机任意目录执行工具。\n"
+                "想用 /new <路径>，先在 config.yaml 里配：\n"
+                "  policy:\n"
+                "    allowed_workdir_roots:\n"
+                '      - "D:/Workplace"\n'
+                "不带参数的 /new 可以直接用，它沿用当前会话的仓库。"
+            )
+
+        raw = " ".join(args).strip().strip('"').strip("'")
+        try:
+            workdir = Path(raw).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            return None, f"路径解析失败：{raw}（{exc}）"
+        if not workdir.is_dir():
+            return None, f"路径不存在或不是目录：{workdir}"
+        if not self._cfg.policy.is_workdir_allowed(workdir):
+            listed = "\n".join(f"  - {r}" for r in roots)
+            return None, f"这个目录不在 allowed_workdir_roots 之下：\n{workdir}\n允许的根目录：\n{listed}"
+        return workdir, ""
+
     async def _resolve_prefix(self, token: str) -> tuple[str | None, str]:
         """把 ID 前缀解析成完整 session_id。只有唯一匹配才接受。
 
@@ -221,11 +305,12 @@ class CommandHandler:
         active = self._state.active
         lines: list[str] = []
         if active is None:
-            lines.append("当前没有活跃会话。发 /sessions 看列表，再 /use <序号>。")
+            lines.append("当前没有活跃会话。发 /sessions 看列表，再 /use <序号>；或 /new 新建一条。")
         else:
+            suffix = "（新会话，尚未落盘）" if active.pending_create else ""
             lines.extend(
                 [
-                    f"活跃会话：{active.short_id} · {active.title}",
+                    f"活跃会话：{active.short_id} · {active.title}{suffix}",
                     f"仓库：{active.workdir}",
                     f"切换于：{active.switched_at}",
                     f"最后活动：{active.last_active_at or '（本桥尚未驱动过）'}",

@@ -9,6 +9,12 @@ policy:
   # 能驱动会话的人。留空 = 不限制（危险，仅私聊自用时可以）
   allowed_open_ids:
     - "ou_xxxxxxxxxxxxxxxxxxxxxxxx"
+  # /new <路径> 只允许这些根目录之下的目录。
+  # 留空（默认）= /new 不接受路径参数，只能用不带参数的 /new 沿用当前会话的仓库。
+  # 这是安全默认：放开路径参数等于让飞书上的人在本机任意目录执行工具。
+  allowed_workdir_roots: []
+  # allowed_workdir_roots:
+  #   - "D:/Workplace"
 
 runner:
   # null = 用 claude-agent-sdk 自带的 CLI；也可填本机 claude 可执行文件路径

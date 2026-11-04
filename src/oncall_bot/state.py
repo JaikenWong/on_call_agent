@@ -32,6 +32,9 @@ class ActiveSession:
     switched_by: str
     switched_at: str
     last_active_at: str | None = None
+    # /new 刚建好、还没跑过第一轮。此时会话文件尚未落盘：
+    # options 要用 session_id= 而不是 resume=，而且不能做「会话必须存在」检查。
+    pending_create: bool = False
 
     @property
     def short_id(self) -> str:
@@ -109,6 +112,16 @@ class StateStore:
             if self._active is not None:
                 self._active.last_active_at = now_iso()
                 self._write()
+
+    async def finish_pending_create(self, title: str | None = None) -> None:
+        """新建的会话跑完第一轮、文件已落盘之后调用。"""
+        async with self._lock:
+            if self._active is None or not self._active.pending_create:
+                return
+            self._active.pending_create = False
+            if title and title.strip():
+                self._active.title = title.strip()
+            self._write()
 
     async def update_session_id(self, new_session_id: str) -> None:
         """SDK 返回的 session_id 与状态不一致时的兜底（实测正常情况不会发生）。"""

@@ -85,9 +85,10 @@ class SessionRunner:
 
         warm = self._connection.is_warm_for(active.session_id)
 
-        # 会话必须仍然存在。绝不自动新建。
-        # 连接还活着就说明会话是活的，没必要再查文件（也避免在持有活连接时误判）。
-        if not warm:
+        # 会话必须仍然存在，否则明确失败。只有 /new 建出来的 pending 会话是例外：
+        # 它的文件要跑完第一轮才落盘（实测只 connect 不 query 不会写文件）。
+        # 连接还活着也跳过检查 —— 连接活着本身就证明会话是活的。
+        if not warm and not active.pending_create:
             info = await asyncio.to_thread(get_session_info, active.session_id, active.workdir)
             if info is None:
                 await self._api.reply_card(
@@ -101,9 +102,15 @@ class SessionRunner:
                 )
                 return
 
+        if warm:
+            status = "正在处理…"
+        elif active.pending_create:
+            status = "正在新建会话并连接 Claude…"
+        else:
+            status = "正在连接 Claude…"
         card_id = await self._api.reply_card(
             msg.message_id,
-            cards.running_card(active.repo_name, "正在处理…" if warm else "正在连接 Claude…"),
+            cards.running_card(active.repo_name, status),
             in_thread=msg.in_thread,
         )
         if card_id is None:
@@ -217,10 +224,15 @@ class SessionRunner:
         if self._cfg.docs.enabled:
             add_dirs.append(str(self._cfg.docs.inbox_dir))
 
+        # /new 建出来的会话还不存在，要用 session_id= 指定新 ID（实测 SDK 会采用这个值）；
+        # 已有会话用 resume= 续上。两者互斥。
+        creating = active.pending_create
+
         return ClaudeAgentOptions(
             cwd=active.workdir,
             add_dirs=add_dirs,
-            resume=active.session_id,
+            resume=None if creating else active.session_id,
+            session_id=active.session_id if creating else None,
             fork_session=False,
             permission_mode=runner.permission_mode,
             disallowed_tools=list(runner.disallowed_tools),
@@ -263,12 +275,22 @@ class SessionRunner:
             await self._fail(renderer, active, "Claude 没有返回结果消息。", "请重试。")
             return
 
-        # session_id 核对（实测正常 resume 时一致）
+        # session_id 核对（实测正常 resume 和指定 session_id 新建时都一致）
         if result.session_id and result.session_id != active.session_id:
             log.warning(
                 "session_id 变化：%s → %s，已更新状态", active.session_id, result.session_id
             )
             await self._state.update_session_id(result.session_id)
+
+        # 拿到 ResultMessage 就说明会话文件已经落盘，pending 标记可以清掉。
+        # 顺带把标题从「新会话」换成 Claude 自己生成的摘要。
+        if active.pending_create:
+            info = await asyncio.to_thread(
+                get_session_info, result.session_id or active.session_id, active.workdir
+            )
+            title = (info.custom_title or info.summary) if info else None
+            await self._state.finish_pending_create(title)
+            log.info("新会话 %s 已落盘，标题=%r", active.short_id, title)
 
         await self._state.touch_active()
 

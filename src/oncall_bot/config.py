@@ -29,14 +29,31 @@ class FeishuConfig(BaseModel):
 
 
 class PolicyConfig(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+
     require_mention_in_group: bool = True
     allowed_open_ids: list[str] = Field(default_factory=list)
+    # /new <路径> 只允许这些根目录之下的目录。留空 = /new 不接受路径参数，
+    # 只能沿用当前活跃会话的仓库。安全默认：否则等于让飞书上的人在本机任意目录执行工具。
+    allowed_workdir_roots: list[Path] = Field(default_factory=list)
+
+    @field_validator("allowed_workdir_roots", mode="after")
+    @classmethod
+    def _expand_roots(cls, value: list[Path]) -> list[Path]:
+        return [Path(p).expanduser().resolve() for p in value]
 
     def is_allowed(self, open_id: str) -> bool:
         """白名单留空时不限制。"""
         if not self.allowed_open_ids:
             return True
         return open_id in self.allowed_open_ids
+
+    def is_workdir_allowed(self, path: Path) -> bool:
+        """留空时一律返回 False —— 调用方据此提示去配白名单。"""
+        if not self.allowed_workdir_roots:
+            return False
+        target = Path(path).expanduser().resolve()
+        return any(target == root or root in target.parents for root in self.allowed_workdir_roots)
 
 
 class RunnerConfig(BaseModel):
