@@ -1,0 +1,37 @@
+[project]
+name = "oncall-bot"
+version = "0.1.0"
+description = "飞书 ↔ Claude Code 会话桥（全局单活跃会话）"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.178",
+    "lark-oapi>=1.7.5",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+oncall-bot = "oncall_bot.__main__:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oncall_bot"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,67 @@
+# 复制为 config.yaml 后填写。config.yaml 已在 .gitignore 中。
+feishu:
+  app_id: "cli_xxxxxxxxxxxx"
+  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxx"
+
+policy:
+  # 群聊里必须 @ 机器人才响应
+  require_mention_in_group: true
+  # 能驱动会话的人。留空 = 不限制（危险，仅私聊自用时可以）
+  allowed_open_ids:
+    - "ou_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+runner:
+  # null = 用 claude-agent-sdk 自带的 CLI；也可填本机 claude 可执行文件路径
+  cli_path: null
+  # bypassPermissions：工具直接执行，不询问。disallowed_tools 仍然生效。
+  permission_mode: "bypassPermissions"
+  disallowed_tools:
+    - "Bash(rm -rf*)"
+    - "Bash(git push --force*)"
+    - "Bash(git reset --hard*)"
+    - "Bash(git clean -fd*)"
+  # 注意：开启云文档读取需要在飞书开放平台申请权限
+  #   docx:document:readonly（新版文档正文）
+  #   wiki:wiki:readonly（知识库节点）
+  #   drive:drive:readonly（文档内嵌图片下载）
+  # 改完权限要发布新版本并等审核通过，否则接口返回 99991672
+  # 加载哪些配置来源。含 "project" 时会加载目标仓库的 .claude/（hooks / MCP / skills）
+  setting_sources: ["user", "project"]
+  # null = 继承本机 ~/.claude/settings.json 里的模型配置
+  model: null
+  max_turns: 60
+  turn_timeout_seconds: 1800
+  idle_output_timeout_seconds: 300
+  max_queue: 5
+  # Claude 连接跨轮复用，空闲这么久之后断开。0 = 永不自动断开。
+  # 复用能省掉每轮 8 秒量级的连接成本（19MB 的会话上是 11.75s → 1.62s）。
+  # 代价：桥在连接期间一直占着这条会话，更不能在终端里打开同一条。
+  connection_idle_seconds: 900
+  # 只在需要覆盖网关 / 模型时才填，例如 ANTHROPIC_BASE_URL
+  env: {}
+  system_prompt_append: |
+    你正通过飞书机器人被远程调用，用户看不到你的终端，也无法回答交互式提问。
+    回复保持简洁，结尾用 3 行以内总结改动。
+    需要用户决策时，基于合理假设继续，并在结尾列出你的假设。
+    涉及生产环境、数据库写操作、强制推送时，先停下来说明风险并等待下一条消息确认。
+
+render:
+  update_interval_ms: 1200
+  max_card_chars: 6000
+  session_list_limit: 10
+
+docs:
+  # 消息里带飞书云文档链接时，先抓成本地 md 再交给 Claude 读
+  enabled: true
+  # 抓下来的文档放这里（不写进目标仓库），通过 add_dirs 授权 Claude 读取
+  inbox_dir: "~/.oncall-bot/inbox"
+  max_chars_per_doc: 200000
+  max_docs_per_message: 5
+  # 下载文档内嵌图片到 <文档名>.assets/，正文里用绝对路径引用，Claude 可用 Read 看图
+  # 需要权限 drive:drive:readonly；缺权限时正文照常抓，图片位置留占位说明
+  fetch_images: true
+  max_images_per_doc: 40
+  max_image_bytes: 10485760
+
+state_file: "~/.oncall-bot/state.json"
+log_dir: "~/.oncall-bot/logs"

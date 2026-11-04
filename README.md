@@ -1,0 +1,238 @@
+# on_call_bot — 飞书 ↔ Claude Code 会话桥
+
+把本机**已存在**的一条 Claude Code 会话接到飞书机器人上。在飞书里发一句话，这条会话就在它自己的仓库里继续干活，过程流式回到飞书卡片。
+
+任意时刻只驱动**一条**会话（全局单活跃）。会话自带固定工作目录，用 `/sessions` 看列表、`/use` 切换。
+
+设计与实测结论见 [`docs/飞书绑定Claude-Code会话-设计试用指南.md`](docs/飞书绑定Claude-Code会话-设计试用指南.md)。
+
+---
+
+## 它不做什么
+
+- **不自动新建会话。** 会话文件没了就明确报错，让你去终端开一条再 `/use`。
+- 不做多群并行。谁发消息都驱动同一条会话，输出回到发消息的那个窗口。
+- 不做权限审批卡片。第一版只有 `bypassPermissions`，靠工具黑名单兜底（见下面的风险）。
+- 不支持图片 / 文件附件输入。云文档**链接**支持（见后文）。
+- 必须跑在会话所在的那台机器上，关机即不可用。
+
+---
+
+## 1. 环境
+
+```powershell
+conda create -n oncall python=3.12 -y
+conda activate oncall
+pip install -e .
+```
+
+本机需要已安装并登录过 Claude Code（`claude --version` 能跑通）。模型与认证**自动继承** `~/.claude/settings.json`，不需要在本项目里再配一遍。
+
+验证环境（不需要飞书凭据，会真实调用一次模型）：
+
+```powershell
+python scripts/smoke_runner.py
+```
+
+正常输出以 `全部通过` 结束，覆盖 resume 上下文延续、会话丢失处理、命令、队列、超时中断、云文档抓取。
+
+---
+
+## 2. 飞书开放平台配置
+
+1. 创建**企业自建应用**，开启「机器人」能力。
+2. 权限（最小集）：
+
+   | 权限 | 用途 |
+   |------|------|
+   | `im:message` | 读消息 |
+   | `im:message:send_as_bot` | 发消息 / 发卡片 |
+   | `im:message.p2p_msg:readonly` | **私聊消息（主要用法，必须）** |
+   | `im:message.group_at_msg:readonly` | 群里被 @ 的消息（只在群里用才需要）|
+   | `docx:document:readonly` | 读新版云文档正文（开启 `docs.enabled` 才需要）|
+   | `wiki:wiki:readonly` | 解析知识库链接（同上）|
+   | `drive:drive:readonly` | **下载文档里的图片**（没有这个就只有文字，图片位置会留占位说明）|
+
+   权限改完必须**发布新版本并等审核通过**，否则接口仍然返回 `99991672`。
+
+3. 事件订阅：选「**使用长连接接收事件**」，订阅 `im.message.receive_v1`。
+4. 回调配置：选「**使用长连接接收回调**」，订阅 `card.action.trigger`。第一版的卡片没有按钮，这一步可以先跳过，留给以后的审批卡片。
+5. 「版本管理与发布」里把**可用范围**设成包含你自己（私聊机器人要求应用对你可见），然后发布版本等审核通过。
+
+长连接模式不需要公网地址，也不需要 `verification_token` / `encrypt_key`。
+
+**私聊用法不需要建群、不需要 @ 机器人。** 审核通过后在飞书里搜应用名就能直接私聊。
+
+拿到你自己的 `open_id`：先把 `allowed_open_ids` 留空启动一次，私聊机器人发一句 `/help`，日志里会有
+
+```
+收到消息 chat_type=p2p sender_open_id=ou_xxxxxxxxxxxx 长度=5
+```
+
+把那个 `ou_` 开头的值填进 `allowed_open_ids`，重启。**留空等于谁都能驱动你的本机 shell，别忘了填回去。**
+
+---
+
+## 3. 配置
+
+```powershell
+Copy-Item config.example.yaml config.yaml
+```
+
+然后填 `feishu.app_id` / `feishu.app_secret` / `policy.allowed_open_ids`。各字段说明在 `config.example.yaml` 的注释里。
+
+`config.yaml` 已在 `.gitignore` 中，不要提交。
+
+---
+
+## 4. 启动
+
+```powershell
+conda activate oncall
+python -m oncall_bot --config config.yaml
+```
+
+加 `--debug` 开 DEBUG 日志。日志同时写到控制台和 `~/.oncall-bot/logs/oncall-bot.log`（8MB 轮转，留 5 份）。
+
+Windows 开机自启：用「任务计划程序」新建任务，触发器选「用户登录时」，操作填
+
+- 程序：`C:\Users\<你>\.conda\envs\oncall\python.exe`
+- 参数：`-m oncall_bot --config config.yaml`
+- 起始于：`d:\Workplace\on_call_bot`
+
+---
+
+## 5. 用法
+
+**私聊**：直接发消息，不用 @。
+**群聊**：需要 @ 机器人（`policy.require_mention_in_group: true` 时）。
+
+> 私聊没有 @ 这道闸门，意味着**你发的每一句话都会被转给 Claude**，包括「嗯」「好」这种。想随口说话又不触发，就先发 `/stop`，或者换个思路：把闲聊放在别处。命令（`/` 开头）不会转给 Claude。
+
+### 连接复用
+
+Claude 连接**跨轮复用**，不是每条消息都重启一次。实测在 19MB 的会话上，每轮新建连接要 11.75 秒，复用之后稳定在 1.62 秒。
+
+连接会在这些情况下被丢弃，下一条消息重连（多付一次约 8 秒）：
+
+- `/stop` 或超时中断 —— 实测 `interrupt()` 之后连接不可复用，必须重连
+- `/use` 切换会话
+- Claude 进程异常退出
+- 空闲超过 `runner.connection_idle_seconds`（默认 900 秒，设成 0 则永不自动断开）
+
+`/status` 能看到当前连接状态。
+
+**代价**：桥在连接期间一直占着这条会话。本来就不该在终端里打开同一条会话，现在更不行。想去终端用，先 `/use` 切到别的会话，或者等空闲超时断开。
+
+| 命令 | 说明 |
+|------|------|
+| `/sessions` | 列出本机最近的 Claude Code 会话（序号、ID 前 8 位、标题、仓库路径、分支、最后活动） |
+| `/use <序号\|会话ID>` | 切换活跃会话。序号来自最近一次 `/sessions`；会话 ID 可以直接用列表里显示的前 8 位，只要唯一匹配。匹配到多条会列出候选让你再选 |
+| `/status` | 当前会话、运行状态、队列长度、Claude 连接状态、权限模式 |
+| `/stop` | 中断当前任务并清空队列 |
+| `/help` | 命令说明 |
+
+直接发文字就是把需求交给当前会话。运行中再发会排队（上限 `runner.max_queue`），严格串行。
+
+**切换会话前先 `/stop`。** 运行中 `/use` 会被拒绝。
+
+**桥使用某条会话期间，不要在终端里同时打开同一条会话** —— 两边同时写会弄乱历史。
+
+### 云文档链接
+
+直接在消息里贴飞书云文档链接即可：
+
+```
+@机器人 按这个文档改一下 https://xxx.feishu.cn/docx/AbCd1234...
+```
+
+桥会先把文档抓成本地 md（放在 `~/.oncall-bot/inbox/<会话ID前8位>/`），再把路径附在需求后面交给 Claude。inbox 不在你的仓库里，通过 `add_dirs` 单独授权给 Claude 读取，不会污染代码库。
+
+抓到的内容包括：
+
+- **标题层级、有序/无序列表、代码块、引用、待办、分割线** —— 正文走 block 树渲染，不是纯文本接口
+- **文档里引用的其他文档** —— 渲染成 `[标题](真实链接)`，Claude 想继续追就能追
+- **内嵌图片** —— 下载到 md 同目录的 `.assets/` 文件夹，正文里用本机绝对路径引用，Claude 用 Read 工具就能看图
+
+> 为什么不用飞书的纯文本接口：它会丢图片位置。实测一篇 234 个 block 的文档有 24 张图，纯文本接口只给出 23 个 `image.png` 占位符（有一张被包在容器块里直接跳过了），按顺序往回填必然错位。走 block 树则位置完全准确，正文也从 6883 字变成 9268 字。
+
+支持：新版文档（`/docx/`）、知识库里指向新版文档的节点（`/wiki/`）。
+不支持：电子表格、多维表格、旧版文档、云空间文件 —— 会明确告诉你不支持，并建议导出成文件。
+
+**权限是最常见的坑**，分两层：
+
+1. **文档本身的访问权**：机器人是独立身份，把文档分享到群里它**读不到**。需要在文档的「分享」里把机器人加为协作者（可阅读），或者把文档设为组织内可阅读。
+2. **应用的接口权限**：图片下载要 `drive:drive:readonly`。缺这个时正文照常抓取，图片位置留一行占位说明，并在回复里告诉你该加哪个权限。
+
+两种情况机器人都会直接说出来，不会假装读到了。
+
+---
+
+## 6. 风险，使用前必读
+
+1. **`permission_mode: bypassPermissions` 等于把本机 shell 交给白名单里的人。** Claude 会直接执行工具调用，不询问。`runner.disallowed_tools` 是唯一兜底，默认拦了 `rm -rf`、`git push --force`、`git reset --hard`、`git clean -fd`。按你的实际情况加。
+2. **`setting_sources` 含 `project` 时会加载目标仓库的 `.claude/`**（hooks、MCP、skills）。只在你信任的仓库的会话上用。不想要就把它改成 `["user"]`。
+3. `policy.allowed_open_ids` 留空表示**不限制任何人**。生产使用务必填上。
+4. 云文档会落到本机磁盘。开启 `docs.enabled` 前确认 inbox 目录位置可接受。
+
+---
+
+## 7. 项目结构
+
+```
+src/oncall_bot/
+├─ __main__.py        入口：加载配置 → 主循环 → 飞书长连接线程
+├─ config.py          pydantic 配置模型与校验
+├─ app.py             消息主流程（去重 → @ 校验 → 白名单 → 命令 → 入队）
+├─ policy.py          message_id TTL 去重
+├─ state.py           全局活跃会话 + 原子持久化
+├─ commands.py        /sessions /use /status /stop /help
+├─ docs_fetch.py      飞书云文档链接 → 本地 md（含图片下载）
+├─ docx_render.py     文档 block 树 → markdown
+├─ feishu/
+│  ├─ ws.py           长连接线程（独立 event loop）
+│  ├─ api.py          areply / apatch / 机器人 open_id / docx / wiki
+│  ├─ cards.py        卡片 JSON（纯函数）
+│  └─ parser.py       事件 → IncomingMessage
+└─ runner/
+   ├─ connection.py   跨轮复用的 Claude 连接
+   ├─ dispatcher.py   单队列 + worker + /stop + 空闲断连
+   ├─ session_runner.py  用 ClaudeSDKClient resume 跑一轮
+   └─ render.py       SDK 消息 → 卡片正文 + 节流更新
+```
+
+---
+
+## 8. 卡片上的 markdown
+
+飞书卡片的 markdown 支持是个子集，实测结果（`scripts/check_card_markdown.py` 发对照卡片验的）：
+
+**能直接渲染**：加粗、斜体、删除线、链接、代码围栏（带行号和语法高亮）、有序/无序列表及嵌套、`---` 分割线。
+
+**不能渲染**，渲染层做了等价替换：
+
+| 原文 | 卡片上显示成 | 为什么这么选 |
+|------|-------------|-------------|
+| `## 标题` | **标题**（加粗）| 飞书不渲染任何级别的标题 |
+| markdown 表格 | 对齐的等宽文本块 | 竖线和 `\|---\|` 分隔行会丢掉，中日韩字符按双宽计算列宽 |
+| 行内代码 `` `x` `` | <font color='blue'>蓝色文字</font> | 实测只有 `<font color>` 有效：`<code>` 和 `<u>` 标签被静默吃掉，`grey` 不在调色板里，`red` 像报错，`**粗体**` 会和模型自己的加粗混在一起 |
+
+想自己复验（都发到 `allowed_open_ids` 里第一个人的私聊）：
+
+```powershell
+python scripts/check_card_markdown.py            # 语法对照卡片
+python scripts/check_card_markdown.py --inline   # 行内强调写法对照卡片
+python scripts/check_card_markdown.py --sample   # 走真实渲染管线的示例卡片
+```
+
+> 一个坑：`<font>` 标签即使颜色名不被支持，标签本身也会被静默吃掉。所以**不能靠「标签没露出来」判断生效**，必须看有没有视觉变化。
+
+---
+
+## 9. 已知限制
+
+- 桥必须和会话在同一台机器上。
+- 同一条会话不能同时在终端和飞书里用。
+- 卡片上**不显示费用**：本机走的是第三方网关，SDK 报的 `total_cost_usd` 是按 Anthropic 价目表估的，和实际计费无关。显示的是耗时 / 轮数 / token 数。
+- `AskUserQuestion` 这类交互式提问走不通，`system_prompt_append` 里已要求模型基于合理假设继续并列出假设。
+- 桥在某轮中途被杀掉时，那张「处理中」卡片会在下次启动时被刷成「状态未知」，但那一轮的真实结果需要你去终端 `claude --resume <id>` 确认。
