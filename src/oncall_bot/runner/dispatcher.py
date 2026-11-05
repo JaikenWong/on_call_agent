@@ -84,11 +84,11 @@ class Dispatcher:
     ) -> SubmitResult:
         """入队一条需求。
 
-        容量检查发生在调用方领走待处理图片**之前**（见 App._handle_message）：
-        否则队列满时图片已经从 pending 里清空了，只留在被丢弃的局部变量里 ——
+        容量检查发生在调用方领走待处理附件**之前**（见 App._handle_message）：
+        否则队列满时附件已经从 pending 里清空了，只留在被丢弃的局部变量里 ——
         文件还在磁盘上，但再也不会被任何消息引用。
         """
-        # 图片在入队时就定下来：排队期间又发了新图，不该混进这一条需求
+        # 附件在入队时就定下来：排队期间又发了新附件，不该混进这一条需求
         handle = TurnHandle(msg=msg, attachments=list(attachments or []))
         try:
             self._queue.put_nowait(handle)
@@ -106,7 +106,7 @@ class Dispatcher:
         return SubmitResult(True)
 
     def has_room(self) -> bool:
-        """队列还有空位吗。调用方据此决定要不要领走待处理图片。"""
+        """队列还有空位吗。调用方据此决定要不要领走待处理附件。"""
         return not self._queue.full()
 
     async def stop_current(self) -> str:

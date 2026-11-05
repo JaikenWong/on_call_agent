@@ -89,7 +89,8 @@ class App:
             ):
                 await self._api.reply_text(
                     unsupported.message_id,
-                    f"暂只支持文本消息（收到 {unsupported.message_type}）。",
+                    f"暂不支持这种消息（收到 {unsupported.message_type}）。"
+                    "目前支持文字、图片、文件和富文本。",
                     in_thread=unsupported.in_thread,
                 )
             return
@@ -113,9 +114,9 @@ class App:
         )
         log.debug("消息正文：%r", msg.text)
 
-        # 图片先下载。纯图片消息只回执、不跑一轮（飞书里图片是独立消息、不能带文字，
-        # 人的习惯是先发图再说需求），图文混排的 post 消息则正常跑一轮。
-        if msg.image_keys and not await self._handle_images(msg):
+        # 附件先下载。纯附件消息只回执、不跑一轮（飞书里图片 / 文件是独立消息、不能带文字，
+        # 人的习惯是先发东西再说需求），图文混排的 post 消息则正常跑一轮。
+        if msg.attachments and not await self._handle_attachments(msg):
             return
 
         if not msg.text:
@@ -140,7 +141,7 @@ class App:
             await self._api.reply_text(
                 msg.message_id,
                 f"队列已满（{self._cfg.runner.max_queue} 条），请等当前任务跑完再发。"
-                "攒着的图片会留着，下一条成功的需求会带上。",
+                "攒着的附件会留着，下一条成功的需求会带上。",
                 in_thread=msg.in_thread,
             )
             return
@@ -149,24 +150,24 @@ class App:
         if result.note:
             await self._api.reply_text(msg.message_id, result.note, in_thread=msg.in_thread)
 
-    async def _handle_images(self, msg: IncomingMessage) -> bool:
-        """处理消息里的图片。返回 False 表示本条消息到此为止，不再往下走。"""
+    async def _handle_attachments(self, msg: IncomingMessage) -> bool:
+        """处理消息里的图片 / 文件。返回 False 表示本条消息到此为止，不再往下走。"""
         if not self._cfg.attachments.enabled:
             await self._api.reply_text(
                 msg.message_id,
-                "图片处理已关闭（配置 attachments.enabled）。请把需求用文字描述。",
+                "附件处理已关闭（配置 attachments.enabled）。请把需求用文字描述。",
                 in_thread=msg.in_thread,
             )
             return False
 
         active = self._state.active
-        saved, failures = await self._attachments.download_images(
-            msg.message_id, msg.image_keys, active.short_id if active else "unbound"
+        saved, failures = await self._attachments.download(
+            msg.message_id, msg.attachments, active.short_id if active else "unbound"
         )
-        for image in saved:
-            self._pending.add(image)
+        for item in saved:
+            self._pending.add(item)
 
-        if msg.is_image_only:
+        if msg.is_attachment_only:
             await self._api.reply_text(
                 msg.message_id,
                 ack_text(saved, failures, self._pending.peek_count()),
@@ -177,7 +178,7 @@ class App:
         if failures:
             await self._api.reply_text(
                 msg.message_id,
-                "部分图片没能下载：\n" + "\n".join(f"- {r}" for r in failures),
+                "部分附件没能下载：\n" + "\n".join(f"- {r}" for r in failures),
                 in_thread=msg.in_thread,
             )
         return True

@@ -14,6 +14,20 @@ log = logging.getLogger(__name__)
 _MENTION_PLACEHOLDER = re.compile(r"@_(?:user_\d+|all)\s*")
 
 
+@dataclass(frozen=True)
+class AttachmentRef:
+    """消息里的一个附件。kind 决定下载时传给飞书的 type（image / file）。"""
+
+    key: str
+    kind: str = "image"  # "image" | "file"
+    # 文件消息会带原始文件名；图片消息没有，落盘时按文件头定扩展名
+    name: str = ""
+
+    @property
+    def is_image(self) -> bool:
+        return self.kind == "image"
+
+
 @dataclass
 class IncomingMessage:
     message_id: str
@@ -23,21 +37,24 @@ class IncomingMessage:
     sender_open_id: str
     text: str
     mentioned_bot: bool
-    image_keys: list[str] = field(default_factory=list)
+    attachments: list[AttachmentRef] = field(default_factory=list)
 
     @property
     def in_thread(self) -> bool:
         return bool(self.thread_id)
 
     @property
-    def is_image_only(self) -> bool:
-        """只有图片、没有文字 —— 这种不直接跑一轮，先攒着等后续说明。"""
-        return bool(self.image_keys) and not self.text.strip()
+    def is_attachment_only(self) -> bool:
+        """只有附件、没有文字 —— 这种不直接跑一轮，先攒着等后续说明。"""
+        return bool(self.attachments) and not self.text.strip()
 
 
 @dataclass
 class UnsupportedMessage(Exception):
-    """非文本消息。调用方按同样的 @ / 白名单规则决定是否回复「暂只支持文本」。"""
+    """既不是文本也不是附件的消息（语音、视频、表情包等）。
+
+    调用方按同样的 @ / 白名单规则决定是否回复「暂不支持」。
+    """
 
     message_id: str
     chat_id: str
@@ -56,10 +73,10 @@ def strip_mentions(text: str) -> str:
     return _MENTION_PLACEHOLDER.sub(" ", text).strip()
 
 
-def extract_content(message_type: str, content_json: str) -> tuple[str, list[str]] | None:
-    """从飞书 content（JSON 字符串）里取出 (文本, 图片 key 列表)。
+def extract_content(message_type: str, content_json: str) -> tuple[str, list[AttachmentRef]] | None:
+    """从飞书 content（JSON 字符串）里取出 (文本, 附件列表)。
 
-    不支持的消息类型返回 None。纯图片消息返回空文本 + 一个 key。
+    不支持的消息类型返回 None。纯图片 / 纯文件消息返回空文本 + 一个附件。
     """
     try:
         content: Any = json.loads(content_json or "{}")
@@ -72,13 +89,21 @@ def extract_content(message_type: str, content_json: str) -> tuple[str, list[str
 
     if message_type == "image":
         key = content.get("image_key")
-        return ("", [key]) if isinstance(key, str) and key else None
+        return ("", [AttachmentRef(key=key)]) if isinstance(key, str) and key else None
+
+    if message_type == "file":
+        # {"file_key": "file_v3_...", "file_name": "xxx.html"}
+        key = content.get("file_key")
+        if not (isinstance(key, str) and key):
+            return None
+        name = content.get("file_name")
+        return ("", [AttachmentRef(key=key, kind="file", name=name if isinstance(name, str) else "")])
 
     if message_type == "post":
         # {"title": "...", "content": [[{"tag":"text","text":"..."},
         #                               {"tag":"img","image_key":"..."}], ...]}
         parts: list[str] = []
-        image_keys: list[str] = []
+        refs: list[AttachmentRef] = []
         title = content.get("title")
         if isinstance(title, str) and title.strip():
             parts.append(title.strip())
@@ -99,19 +124,30 @@ def extract_content(message_type: str, content_json: str) -> tuple[str, list[str
                     elif tag == "img":
                         key = seg.get("image_key")
                         if isinstance(key, str) and key:
-                            image_keys.append(key)
+                            refs.append(AttachmentRef(key=key))
+                    elif tag == "file":
+                        key = seg.get("file_key")
+                        if isinstance(key, str) and key:
+                            name = seg.get("file_name")
+                            refs.append(
+                                AttachmentRef(
+                                    key=key,
+                                    kind="file",
+                                    name=name if isinstance(name, str) else "",
+                                )
+                            )
                 joined = "".join(segs)
                 if joined.strip():
                     parts.append(joined.strip())
-        if not parts and not image_keys:
+        if not parts and not refs:
             return None
-        return ("\n".join(parts), image_keys)
+        return ("\n".join(parts), refs)
 
     return None
 
 
 def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
-    """解析 P2ImMessageReceiveV1。非文本消息抛 UnsupportedMessage。"""
+    """解析 P2ImMessageReceiveV1。不支持的消息类型抛 UnsupportedMessage。"""
     event = event_data.event
     message = event.message
     sender_open_id = ""
@@ -142,7 +178,7 @@ def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
             mentioned_bot=mentioned_bot,
             message_type=message_type,
         )
-    text, image_keys = extracted
+    text, attachments = extracted
 
     return IncomingMessage(
         message_id=message_id,
@@ -152,5 +188,5 @@ def parse_message(event_data: Any, bot_open_id: str) -> IncomingMessage:
         sender_open_id=sender_open_id,
         text=strip_mentions(text),
         mentioned_bot=mentioned_bot,
-        image_keys=image_keys,
+        attachments=attachments,
     )

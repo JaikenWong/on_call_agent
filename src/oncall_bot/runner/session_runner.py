@@ -25,7 +25,7 @@ from claude_agent_sdk import (
     get_session_info,
 )
 
-from ..attachments import append_attachments
+from ..attachments import append_attachments, summarize_paths
 from ..config import Config
 from ..docs_fetch import DocFetcher, FetchOutcome, build_prompt, summarize_outcome
 from ..feishu import cards
@@ -59,7 +59,7 @@ class TurnHandle:
     _renderer: TurnRenderer | None = field(default=None, repr=False)
     # 本轮期间后台任务的动态，附在卡片上提醒用户「那些输出不属于本轮回答」
     background_note: str = ""
-    # 入队时领走的待处理图片（飞书里先发图、再说需求）
+    # 入队时领走的待处理附件（飞书里先发图 / 发文件、再说需求）
     attachments: list[Path] = field(default_factory=list)
     _interrupt_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _interrupted: bool = field(default=False, repr=False)
@@ -183,7 +183,7 @@ class SessionRunner:
         if not outcome.empty:
             renderer.add_note(summarize_outcome(outcome))
         if handle.attachments:
-            renderer.add_note(f"带了 {len(handle.attachments)} 张图片")
+            renderer.add_note(f"带了 {summarize_paths(handle.attachments)}")
 
         try:
             client, created = await self._connection.acquire(active.session_id, options)

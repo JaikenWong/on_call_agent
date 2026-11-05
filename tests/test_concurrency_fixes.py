@@ -6,7 +6,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from oncall_bot.attachments import AttachmentStore, PendingAttachments, SavedImage
+from oncall_bot.attachments import AttachmentStore, PendingAttachments, SavedAttachment
 from oncall_bot.config import (
     AttachmentsConfig,
     Config,
@@ -15,7 +15,7 @@ from oncall_bot.config import (
     RunnerConfig,
 )
 from oncall_bot.feishu import cards
-from oncall_bot.feishu.parser import IncomingMessage
+from oncall_bot.feishu.parser import AttachmentRef, IncomingMessage
 from oncall_bot.runner.dispatcher import Dispatcher
 from oncall_bot.runner.render import TurnRenderer
 from oncall_bot.runner.session_runner import SessionRunner, TurnHandle
@@ -126,7 +126,7 @@ async def test_full_queue_is_visible_before_taking_images():
     cfg.runner = RunnerConfig(max_queue=1)
     dispatcher = Dispatcher(cfg, FakeApi(), FakeState())  # type: ignore[arg-type]
     pending = PendingAttachments(ttl_seconds=600, max_items=9)
-    pending.add(SavedImage(path=Path("/tmp/a.png"), size=1))
+    pending.add(SavedAttachment(path=Path("/tmp/a.png"), size=1))
 
     assert dispatcher.has_room() is True
     await dispatcher.submit(make_msg("第一条"))
@@ -200,8 +200,9 @@ async def test_image_filenames_do_not_collide_within_same_second(tmp_path):
 
     store = AttachmentStore(DownloadApi(), AttachmentsConfig(dir=tmp_path, enabled=True))  # type: ignore[arg-type]
 
-    first, _ = await store.download_images("om_aaa", ["img_1"], "abcdef12")
-    second, _ = await store.download_images("om_bbb", ["img_1"], "abcdef12")
+    refs = [AttachmentRef(key="img_1")]
+    first, _ = await store.download("om_aaa", refs, "abcdef12")
+    second, _ = await store.download("om_bbb", refs, "abcdef12")
 
     assert first[0].path != second[0].path
     assert first[0].path.exists() and second[0].path.exists()

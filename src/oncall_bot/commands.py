@@ -79,7 +79,7 @@ class CommandHandler:
             note = await self._dispatcher.stop_current()
             dropped = self._clear_pending("/stop")
             if dropped:
-                note = f"{note} 另外丢弃了攒着的 {dropped} 张图片。"
+                note = f"{note} 另外丢弃了攒着的 {dropped} 个附件。"
             await self._reply(msg, note)
         else:
             await self._reply(msg, f"未知命令 `{name}`。发 /help 看可用命令。")
@@ -186,7 +186,7 @@ class CommandHandler:
         )
         # 立刻释放旧连接：桥占着会话时不该让它一直占着，用户可能要去终端里打开它
         await self._dispatcher.connection.close("活跃会话已切换")
-        # 攒着的图片是给上一条会话的上下文准备的，换会话就作废
+        # 攒着的附件是给上一条会话的上下文准备的，换会话就作废
         self._clear_pending("切换会话")
         await self._state.set_active(session)
         log.info("活跃会话切换为 %s（%s）", session.short_id, session.workdir)
@@ -335,7 +335,7 @@ class CommandHandler:
         lines.append(f"Claude 连接：{self._dispatcher.connection.state_text}")
         if self._pending is not None:
             waiting = self._pending.peek_count()
-            lines.append(f"攒着的图片：{waiting} 张" + ("（下一条需求会带上）" if waiting else ""))
+            lines.append(f"攒着的附件：{waiting} 个" + ("（下一条需求会带上）" if waiting else ""))
         lines.append(f"权限模式：{self._cfg.runner.permission_mode}")
         await self._reply(msg, "\n".join(lines))
 

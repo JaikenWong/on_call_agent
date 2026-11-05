@@ -470,8 +470,8 @@ async def run_checks(cfg: Config, session_id: str) -> None:
     print("\n== 9. 后台任务不串到本轮（回放实测到的真实序列）==")
     await check_turn_stream()
 
-    # ---------- 10. 消息里的图片 ----------
-    print("\n== 10. 飞书消息里的图片 ==")
+    # ---------- 10. 消息里的图片和文件 ----------
+    print("\n== 10. 飞书消息里的图片和文件 ==")
     await check_attachments(cfg)
 
 
@@ -483,11 +483,23 @@ async def check_attachments(cfg: Config) -> None:
         append_attachments,
     )
     from oncall_bot.feishu.api import SCOPE_DENIED_CODE, FeishuApiError
-    from oncall_bot.feishu.parser import extract_content
+    from oncall_bot.feishu.parser import AttachmentRef, extract_content
 
-    # 10.1 解析：纯图片消息 / 图文混排 post / 纯文本
+    # 10.1 解析：纯图片 / 纯文件 / 图文混排 post / 纯文本
     parsed = extract_content("image", '{"image_key":"img_v3_abc"}')
-    check("纯图片消息解析出 image_key", parsed == ("", ["img_v3_abc"]), str(parsed))
+    check(
+        "纯图片消息解析出 image_key",
+        parsed == ("", [AttachmentRef(key="img_v3_abc")]),
+        str(parsed),
+    )
+
+    parsed_file = extract_content("file", '{"file_key":"file_v3_x","file_name":"demo.html"}')
+    check(
+        "纯文件消息解析出 file_key 和文件名",
+        parsed_file == ("", [AttachmentRef(key="file_v3_x", kind="file", name="demo.html")]),
+        str(parsed_file),
+    )
+    check("文件消息缺 file_key 时返回 None", extract_content("file", '{"file_name":"a"}') is None)
 
     post = (
         '{"title":"需求","content":[['
@@ -499,18 +511,21 @@ async def check_attachments(cfg: Config) -> None:
     check("图文混排 post 同时取出文字和两张图",
           parsed_post is not None
           and "把这个按钮改成蓝色" in parsed_post[0]
-          and parsed_post[1] == ["img_v3_one", "img_v3_two"],
+          and [r.key for r in parsed_post[1]] == ["img_v3_one", "img_v3_two"],
           str(parsed_post))
 
     check("纯文本不受影响", extract_content("text", '{"text":"hi"}') == ("hi", []))
-    check("不支持的类型仍然返回 None", extract_content("audio", '{"file_key":"x"}') is None)
+    check("仍不支持的类型返回 None", extract_content("audio", '{"file_key":"x"}') is None)
 
     img_msg = make_msg("")
-    img_msg.image_keys = ["img_v3_abc"]
-    check("纯图片消息能被识别", img_msg.is_image_only)
+    img_msg.attachments = [AttachmentRef(key="img_v3_abc")]
+    check("纯图片消息能被识别", img_msg.is_attachment_only)
+    file_msg = make_msg("")
+    file_msg.attachments = [AttachmentRef(key="file_v3_x", kind="file", name="demo.html")]
+    check("纯文件消息能被识别", file_msg.is_attachment_only)
     mixed = make_msg("改成蓝色")
-    mixed.image_keys = ["img_v3_abc"]
-    check("图文混排不算纯图片", not mixed.is_image_only)
+    mixed.attachments = [AttachmentRef(key="img_v3_abc")]
+    check("图文混排不算纯附件", not mixed.is_attachment_only)
 
     # 10.2 下载并保存
     api = FakeApi()
@@ -518,14 +533,40 @@ async def check_attachments(cfg: Config) -> None:
         update={"dir": cfg.state_file.parent / "attachments"}
     )
     store = AttachmentStore(api, acfg)  # type: ignore[arg-type]
-    saved, failures = await store.download_images("om_1", ["k1", "k2"], "sess1234")
+    saved, failures = await store.download(
+        "om_1", [AttachmentRef(key="k1"), AttachmentRef(key="k2")], "sess1234"
+    )
     check("两张图都保存了", len(saved) == 2 and not failures, f"saved={len(saved)}")
     if saved:
         check("文件真的落盘", saved[0].path.exists(), str(saved[0].path))
         check("按文件头判定扩展名为 .png", saved[0].path.suffix == ".png", saved[0].path.name)
         check("内容是真的 PNG", saved[0].path.read_bytes().startswith(b"\x89PNG"))
 
-    # 10.3 攒着的图片：TTL、上限、领走即清空
+    # 10.2b 文件消息：保留原始文件名、清洗非法字符
+    file_saved, file_failures = await store.download(
+        "om_f",
+        [
+            AttachmentRef(key="fk1", kind="file", name="dreame-rd-digital-platform.html"),
+            AttachmentRef(key="fk2", kind="file", name="报告/2026:Q4.md"),
+        ],
+        "sess1234",
+    )
+    check("文件也能保存", len(file_saved) == 2 and not file_failures, f"saved={len(file_saved)}")
+    if len(file_saved) == 2:
+        check(
+            "落盘名保留原始文件名",
+            file_saved[0].path.name.endswith("-dreame-rd-digital-platform.html"),
+            file_saved[0].path.name,
+        )
+        check(
+            "文件名里的非法字符被清洗",
+            not any(c in file_saved[1].path.name for c in '/:\\'),
+            file_saved[1].path.name,
+        )
+        check("kind 标成 file", file_saved[0].kind == "file")
+        check("name 用原始文件名", file_saved[1].name == "报告/2026:Q4.md", file_saved[1].name)
+
+    # 10.3 攒着的附件：TTL、上限、领走即清空
     pending = PendingAttachments(ttl_seconds=600, max_items=2)
     for image in saved:
         pending.add(image)
@@ -538,14 +579,14 @@ async def check_attachments(cfg: Config) -> None:
     # 过期判定：用一个「10 分钟前加进来」的条目，TTL 设 60 秒
     import time as _time
 
-    from oncall_bot.attachments import SavedImage
+    from oncall_bot.attachments import SavedAttachment
 
     stale = PendingAttachments(ttl_seconds=60, max_items=5)
-    stale.add(SavedImage(path=saved[0].path, size=1, added_at=_time.monotonic() - 600))
-    check("超过 TTL 的图片被丢弃", stale.peek_count() == 0, f"count={stale.peek_count()}")
+    stale.add(SavedAttachment(path=saved[0].path, size=1, added_at=_time.monotonic() - 600))
+    check("超过 TTL 的附件被丢弃", stale.peek_count() == 0, f"count={stale.peek_count()}")
     fresh = PendingAttachments(ttl_seconds=60, max_items=5)
-    fresh.add(SavedImage(path=saved[0].path, size=1))
-    check("未过期的图片保留", fresh.peek_count() == 1)
+    fresh.add(SavedAttachment(path=saved[0].path, size=1))
+    check("未过期的附件保留", fresh.peek_count() == 1)
 
     cleared = PendingAttachments(ttl_seconds=600, max_items=5)
     cleared.add(saved[0])
@@ -556,25 +597,36 @@ async def check_attachments(cfg: Config) -> None:
     check("prompt 保留原需求", prompt.startswith("把按钮改成蓝色"))
     check("prompt 里列出了图片绝对路径", str(saved[0].path) in prompt)
     check("prompt 让 Claude 用 Read 看图", "Read 工具" in prompt)
-    check("没有图片时 prompt 原样返回", append_attachments("改个标题", []) == "改个标题")
+    check("没有附件时 prompt 原样返回", append_attachments("改个标题", []) == "改个标题")
+
+    if len(file_saved) == 2:
+        mixed_prompt = append_attachments("看下这个 demo", [saved[0].path, file_saved[0].path])
+        check("prompt 里图片和文件分开列", "图片（" in mixed_prompt and "文件（" in mixed_prompt)
+        check("prompt 里有文件绝对路径", str(file_saved[0].path) in mixed_prompt)
 
     # 10.5 回执文案
     ack = ack_text(saved, [], 2)
     check("回执说明收到几张", "收到 2 张图片" in ack, ack.splitlines()[0])
     check("回执提示发需求", "把需求发给我" in ack)
+    if file_saved:
+        file_ack = ack_text(file_saved, [], 2)
+        check("文件回执说明收到几个", "收到 2 个文件" in file_ack, file_ack.splitlines()[0])
+        check("文件回执列出文件名", "dreame-rd-digital-platform.html" in file_ack)
 
     # 10.6 缺 im:resource 权限时的提示
     api_scope = FakeApi()
     api_scope.resource_error = FeishuApiError(SCOPE_DENIED_CODE, "Access denied", None)
     store_scope = AttachmentStore(api_scope, acfg)  # type: ignore[arg-type]
-    saved2, failures2 = await store_scope.download_images("om_2", ["k1", "k2", "k3"], "s")
+    saved2, failures2 = await store_scope.download(
+        "om_2", [AttachmentRef(key=f"k{i}") for i in (1, 2, 3)], "s"
+    )
     check("缺权限时没有伪造文件", not saved2)
-    check("缺权限只给一条提示（不是每张一条）", len(failures2) == 1, f"failures={len(failures2)}")
+    check("缺权限只给一条提示（不是每个一条）", len(failures2) == 1, f"failures={len(failures2)}")
     check("提示点名 im:resource", "im:resource" in failures2[0], failures2[0][:50])
 
     # 10.7 关掉开关
     off = AttachmentStore(FakeApi(), acfg.model_copy(update={"enabled": False}))  # type: ignore[arg-type]
-    off_saved, off_failures = await off.download_images("om_3", ["k1"], "s")
+    off_saved, off_failures = await off.download("om_3", [AttachmentRef(key="k1")], "s")
     check("attachments.enabled=false 时不下载", not off_saved and not off_failures)
 
 
