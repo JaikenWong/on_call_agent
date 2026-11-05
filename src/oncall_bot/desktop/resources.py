@@ -73,6 +73,10 @@ class ImageCache:
                 paths = []
                 for index, key in enumerate(json.loads(row["keys"])):
                     data = await api.download_message_resource(row["mid"], key)
+                    known = data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
+                    known = known or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+                    if not known:
+                        raise ValueError("图片格式不支持")
                     ext = _image_ext(data)
                     if not data or ext not in (".png", ".jpg", ".gif", ".webp"):
                         raise ValueError("图片格式不支持")

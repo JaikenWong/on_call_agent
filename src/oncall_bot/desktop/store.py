@@ -22,8 +22,15 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise ValueError("数据库版本不兼容")
+        if version == 1:
+            # Preserve the installed journal before adding the outbox schema.
+            backup = sqlite3.connect(root / "state-before-v2.sqlite3")
+            try:
+                self.db.backup(backup)
+            finally:
+                backup.close()
         self.db.executescript("""
         BEGIN;
         CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL);
@@ -52,11 +59,18 @@ class Store:
           keys TEXT, ts REAL, task_id INTEGER REFERENCES tasks);
         CREATE TABLE IF NOT EXISTS replies(
           id INTEGER PRIMARY KEY REFERENCES inputs, route TEXT, mid TEXT, body TEXT,
-          status TEXT DEFAULT 'pending');
+          status TEXT DEFAULT 'pending', generation INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, fingerprint TEXT, result TEXT);
-        PRAGMA user_version=1;
+        CREATE TABLE IF NOT EXISTS deliveries(
+          task_id INTEGER REFERENCES tasks ON DELETE CASCADE,
+          part INTEGER, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          PRIMARY KEY(task_id,part));
+        PRAGMA user_version=2;
         COMMIT;
         """)
+        if "generation" not in {r[1] for r in self.db.execute("PRAGMA table_info(replies)")}:
+            with self.db:
+                self.db.execute("ALTER TABLE replies ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
 
     def get(self, key, default=None):
         row = self.db.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
@@ -80,6 +94,7 @@ class Store:
             )
             self.db.execute("UPDATE tasks SET state='held' WHERE state IN ('queued','preparing')")
             self.db.execute("UPDATE replies SET status='unknown' WHERE status='sending'")
+            self.db.execute("UPDATE deliveries SET status='unknown' WHERE status='sending'")
             self.release()
 
     def release(self):
@@ -151,7 +166,8 @@ class Store:
                 note = str(exc)
             self.db.execute("RELEASE apply_event")
             self.db.execute(
-                "INSERT INTO replies(id,route,mid,body) VALUES(?,?,?,?)", (i, json.dumps(route), mid, note)
+                "INSERT INTO replies(id,route,mid,body,generation) VALUES(?,?,?,?,?)",
+                (i, json.dumps(route), mid, note, self.get("generation", 0)),
             )
 
     def _apply(self, i, route, mid, text, keys):
@@ -240,10 +256,15 @@ class Store:
         if not text:
             return "图片已登记，请发需求" if keys else "请输入需求"
         snap = dict(s, route=route, revision=rev, mid=mid, text=text, generation=self.get("generation", 0))
-        tid = self.db.execute(
-            "INSERT INTO tasks(input_id,sid,snapshot,state,created) VALUES(?,?,?,'queued',?)",
-            (i, sid, json.dumps(snap), time.time()),
-        ).lastrowid
+        # Keep display numbers and private directories unique after retention
+        # deletes the highest task row. Input IDs alone are not task IDs in v1.
+        highest = self.db.execute("SELECT coalesce(max(id),0) FROM tasks").fetchone()[0]
+        tid = max(highest, self.get("last_task_no", 0)) + 1
+        self.set("last_task_no", tid)
+        self.db.execute(
+            "INSERT INTO tasks(id,input_id,sid,snapshot,state,created) VALUES(?,?,?,?,'queued',?)",
+            (tid, i, sid, json.dumps(snap), time.time()),
+        )
         self.db.execute(
             "UPDATE images SET task_id=? WHERE route=? AND revision=? AND task_id IS NULL", (tid, scope, rev)
         )
@@ -267,6 +288,16 @@ class Store:
             "UPDATE tasks SET state=?,result=?,delivery=CASE WHEN card IS NULL THEN 'none' "
             "ELSE 'pending' END WHERE id=?",
             (state, result, tid),
+        )
+        job = self.task(tid)
+        chunks = []
+        if job["card"] and len(result) > 5000:
+            chunks = [result[start : start + 3500] for start in range(0, len(result), 3500)]
+        elif not job["card"] and state in ("cancelled", "failed", "unknown"):
+            chunks = [f"任务 #{tid} · {state}\n{result}"]
+        self.db.executemany(
+            "INSERT INTO deliveries(task_id,part,body) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+            [(tid, n, body) for n, body in enumerate(chunks)],
         )
         if state == "unknown":
             self.db.execute(

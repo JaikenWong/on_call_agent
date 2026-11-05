@@ -57,6 +57,8 @@ class Engine:
         self.expiry = 0
         self.errors = 0
         self.process = None
+        self.active_task_id = None
+        self.transitioning = False
         self.warm = WarmSlot(store)
         self.images = ImageCache(store)
         self.images.prune()
@@ -117,6 +119,15 @@ class Engine:
             return
         if route == self.store.get("owner") and msg.text.split()[:1] in (["/new"], ["/use"]):
             await self.warm.close()
+        if (
+            route == self.store.get("owner")
+            and msg.text.split()[:1] == ["/new"]
+            and self.active_task_id is not None
+        ):
+            with self.db:
+                # Use the same durable command response path without changing a binding.
+                self.store.accept(route, msg.message_id, "/busy", [])
+            return
         self.store.accept(route, msg.message_id, msg.text, msg.image_keys)
         if msg.image_keys and self.api and route == self.store.get("owner"):
             self.images.prefetch(self.api, msg.message_id, route)
@@ -149,6 +160,18 @@ class Engine:
 
     async def command(self, op, p):
         s = self.store
+        guarded = {
+            "session.acquire",
+            "session.release",
+            "session.import",
+            "session.new",
+            "session.review",
+            "project.revoke",
+            "setup.save",
+        }
+        if op in guarded:
+            self.require_idle()
+        expected_revision = p.get("revision", s.get("revision", 0))
         if op in {
             "session.acquire",
             "session.release",
@@ -247,6 +270,9 @@ class Engine:
                 info = await asyncio.to_thread(get_session_info, sid, path)
                 if not info or not info.cwd or Path(info.cwd).resolve() != Path(path):
                     raise ValueError("历史与目录不匹配")
+            if s.get("revision", 0) != expected_revision:
+                raise ValueError("STALE_VERSION：接管期间绑定已变化")
+            self.require_idle()
             return s.register(path, sid, p.get("title"), bool(p.get("edit")))
         elif op == "session.acquire":
             # Regrant is local and explicit. A failed acquisition rolls the grant back.
@@ -260,6 +286,9 @@ class Engine:
                 raise ValueError("仍有受管进程组，请先核对并结束进程")
             session = s.session(p["sid"])
             found = await asyncio.to_thread(get_session_info, p["sid"], session["path"])
+            self.require_idle()
+            if s.get("revision", 0) != expected_revision:
+                raise ValueError("STALE_VERSION：绑定已变化")
             self.db.execute(
                 "UPDATE sessions SET review=0,fresh=? WHERE sid=?", (session["fresh"] and not found, p["sid"])
             )
@@ -299,6 +328,11 @@ class Engine:
             raise ValueError("未知操作")
         return "完成"
 
+    def require_idle(self):
+        if self.active_task_id is not None:
+            raise ValueError("BUSY：任务正在执行或收尾")
+        self.store.idle()
+
     def valid(self, snap, resumed_rev=None):
         s = self.store
         if (
@@ -330,6 +364,13 @@ class Engine:
         return inputs
 
     async def execute(self, job):
+        self.active_task_id = job["id"]
+        try:
+            await self._execute(job)
+        finally:
+            self.active_task_id = None
+
+    async def _execute(self, job):
         tid = job["id"]
         snap = json.loads(job["snapshot"])
         with self.db:
@@ -409,15 +450,16 @@ class Engine:
                 while line := await asyncio.wait_for(proc.stdout.readline(), 300):
                     frame = json.loads(line)
                     if frame.get("progress") and time.monotonic() - last_patch >= 2:
-                        await asyncio.wait_for(
-                            self.api.patch_card(
-                                card,
-                                cards.running_card(
-                                    snap["title"], f"任务 #{tid} 正在执行 · {frame['progress']}"
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(
+                                self.api.patch_card(
+                                    card,
+                                    cards.running_card(
+                                        snap["title"], f"任务 #{tid} 正在执行 · {frame['progress']}"
+                                    ),
                                 ),
-                            ),
-                            10,
-                        )
+                                10,
+                            )
                         last_patch = time.monotonic()
                     if frame.get("state") in ("succeeded", "failed", "cancelled"):
                         reuse = (
@@ -441,7 +483,7 @@ class Engine:
                 uncertain = state in ("running", "stopping")
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
                 site = f"{Path(frame.filename).name}:{frame.lineno}"
-                cause = f"{type(exc).__name__} ({site}, code={getattr(exc,'winerror',None)})"
+                cause = f"{type(exc).__name__} ({site}, code={getattr(exc, 'winerror', None)})"
                 with self.db:
                     self.store.finish(
                         tid,
@@ -477,7 +519,7 @@ class Engine:
         s = self.store
         r = self.db.execute("SELECT * FROM replies WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
         if r:
-            ok = json.loads(r["route"]) == s.get("owner")
+            ok = json.loads(r["route"]) == s.get("owner") and r["generation"] == s.get("generation", 0)
             with self.db:
                 self.db.execute(
                     "UPDATE replies SET status=? WHERE id=?", ("sending" if ok else "revoked", r["id"])
@@ -492,6 +534,7 @@ class Engine:
             "SELECT * FROM tasks WHERE delivery='pending' AND retry_at<=? ORDER BY id LIMIT 1", (time.time(),)
         ).fetchone()
         if not job:
+            await self.deliver_text_part()
             return
         snap = json.loads(job["snapshot"])
         status = "revoked"
@@ -519,6 +562,35 @@ class Engine:
             self.db.execute(
                 "UPDATE tasks SET delivery=?,retries=retries+1,retry_at=? WHERE id=?",
                 (status, time.time() + min(60, 2 ** (job["retries"] + 1)), job["id"]),
+            )
+
+    async def deliver_text_part(self):
+        row = self.db.execute(
+            "SELECT deliveries.*, tasks.snapshot FROM deliveries JOIN tasks "
+            "ON tasks.id=deliveries.task_id WHERE deliveries.status='pending' "
+            "ORDER BY deliveries.task_id,part LIMIT 1"
+        ).fetchone()
+        if not row:
+            return
+        snap = json.loads(row["snapshot"])
+        allowed = snap["route"] == self.store.get("owner") and snap["generation"] == self.store.get(
+            "generation", 0
+        )
+        with self.db:
+            self.db.execute(
+                "UPDATE deliveries SET status=? WHERE task_id=? AND part=?",
+                ("sending" if allowed else "revoked", row["task_id"], row["part"]),
+            )
+        if not allowed:
+            return
+        try:
+            mid = await asyncio.wait_for(self.api.reply_text(snap["mid"], row["body"]), 15)
+        except Exception:
+            mid = None
+        with self.db:
+            self.db.execute(
+                "UPDATE deliveries SET status=? WHERE task_id=? AND part=?",
+                ("sent" if mid else "unknown", row["task_id"], row["part"]),
             )
 
     async def monitor(self):

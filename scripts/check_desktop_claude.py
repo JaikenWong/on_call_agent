@@ -13,6 +13,9 @@ from pathlib import Path
 
 
 class Handler(BaseHTTPRequestHandler):
+    read_calls = 0
+    edit_calls = 0
+
     def log_message(self, *a):
         pass
 
@@ -21,6 +24,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/v1/messages"):
             self.send_error(404)
             return
+        names = {t["name"] for t in req.get("tools", [])}
+        assert names <= {"mcp__project__project", "mcp__project__edit", "DeferredToolPlaceholder"}, names
+        assert "mcp__project__project" in names
+        use_edit = "mcp__project__edit" in names
+        done = any(
+            part.get("type") == "tool_result"
+            for message in req.get("messages", [])
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if isinstance(part, dict)
+        )
         events = [
             (
                 "message_start",
@@ -46,6 +60,29 @@ class Handler(BaseHTTPRequestHandler):
             ),
             ("message_stop", {}),
         ]
+        if not done:
+            name = "mcp__project__edit" if use_edit else "mcp__project__project"
+            values = (
+                {"path": "probe.txt", "content": "changed"}
+                if use_edit
+                else {"action": "read", "path": "probe.txt"}
+            )
+            if use_edit:
+                Handler.edit_calls += 1
+            else:
+                Handler.read_calls += 1
+            events[1] = (
+                "content_block_start",
+                {
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "tool_probe", "name": name, "input": {}},
+                },
+            )
+            events[2] = (
+                "content_block_delta",
+                {"index": 0, "delta": {"type": "input_json_delta", "partial_json": json.dumps(values)}},
+            )
+            events[4][1]["delta"]["stop_reason"] = "tool_use"
         if req.get("stream"):
             body = "".join(
                 "event: " + name + "\ndata: " + json.dumps(dict(data, type=name)) + "\n\n"
@@ -76,6 +113,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp) / "repo"
         repo.mkdir()
+        (repo / "probe.txt").write_text("read marker", encoding="utf-8")
         env = dict(
             PATH=os.environ["PATH"],
             HOME=tmp,
@@ -105,7 +143,24 @@ def main():
             timeout=90,
         )
         print(runs.returncode, runs.stdout[-800:], runs.stderr[-500:])
+        assert runs.returncode == 0
         assert sum("local probe" in line for line in runs.stdout.splitlines()) == 2
+        assert Handler.read_calls >= 1 and Handler.edit_calls == 0
+        assert (repo / "probe.txt").read_text() == "read marker"
+        snap.update(sid=str(uuid.uuid4()), edit=True, text="edit probe.txt")
+        payload["snapshot"] = snap
+        edit = subprocess.run(
+            [sys.executable, "-m", "oncall_bot.desktop", "--turn"],
+            env=env,
+            text=True,
+            input=json.dumps(payload) + "\n",
+            capture_output=True,
+            timeout=90,
+        )
+        assert edit.returncode == 0, edit.stdout
+        assert Handler.edit_calls == 1
+        assert (repo / "probe.txt").read_text() == "changed"
+        print("Real CLI read-only tools, warm continuation and explicit edit tools verified.")
     server.shutdown()
 
 

@@ -16,7 +16,6 @@ import win32file
 import win32job
 import win32process
 
-
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # winbase.h; absent in win32con.
 
 

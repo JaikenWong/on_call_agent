@@ -36,8 +36,12 @@ def check(folder):
             env=env,
             cwd=tmp,
             timeout=60,
-            check=True,
+            check=False,
         )
+        if result.returncode:
+            raise RuntimeError(
+                f"Packaged engine failed ({result.returncode}): {result.stderr}\n{result.stdout}"
+            )
         msgs = [json.loads(line) for line in result.stdout.splitlines()]
         assert msgs[0]["type"] == "hello" and all(m["ok"] for m in msgs[1:]), msgs
         assert msgs[1]["data"] == msgs[2]["data"]["sid"]
