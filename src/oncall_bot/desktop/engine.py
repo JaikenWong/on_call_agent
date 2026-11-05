@@ -29,6 +29,7 @@ from .runtime import data_root, instance_lock, launch_args
 from .store import Store
 
 MAX_FRAME = 256 * 1024
+PROGRESS_INTERVAL = 2.0
 
 
 def alive(group):
@@ -58,7 +59,6 @@ class Engine:
         self.errors = 0
         self.process = None
         self.active_task_id = None
-        self.transitioning = False
         self.warm = WarmSlot(store)
         self.images = ImageCache(store)
         self.images.prune()
@@ -167,6 +167,7 @@ class Engine:
             "session.new",
             "session.review",
             "project.revoke",
+            "project.set_policy",
             "setup.save",
         }
         if op in guarded:
@@ -178,6 +179,7 @@ class Engine:
             "session.import",
             "session.new",
             "project.revoke",
+            "project.set_policy",
             "pair.revoke",
             "setup.save",
             "app.shutdown",
@@ -292,6 +294,11 @@ class Engine:
             self.db.execute(
                 "UPDATE sessions SET review=0,fresh=? WHERE sid=?", (session["fresh"] and not found, p["sid"])
             )
+        elif op == "project.set_policy":
+            self.require_idle()
+            target = s.session(p["sid"])
+            s.check_dir(target)
+            self.db.execute("UPDATE sessions SET edit=? WHERE path=?", (bool(p["edit"]), target["path"]))
         elif op == "project.revoke":
             s.idle()
             target = s.session(p["sid"])
@@ -341,6 +348,7 @@ class Engine:
             or s.get("generation", 0) != snap["generation"]
             or s.get("revision") != (resumed_rev or snap["revision"])
             or s.session(snap["sid"])["revoked"]
+            or s.session(snap["sid"])["edit"] != snap["edit"]
             or s.session(snap["sid"])["review"]
         ):
             return False
@@ -449,7 +457,7 @@ class Engine:
             async with asyncio.timeout(1800):
                 while line := await asyncio.wait_for(proc.stdout.readline(), 300):
                     frame = json.loads(line)
-                    if frame.get("progress") and time.monotonic() - last_patch >= 2:
+                    if frame.get("progress") and time.monotonic() - last_patch >= PROGRESS_INTERVAL:
                         with contextlib.suppress(Exception):
                             await asyncio.wait_for(
                                 self.api.patch_card(

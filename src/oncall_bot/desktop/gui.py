@@ -116,6 +116,10 @@ class Window(QMainWindow):
                 ("撤销项目授权", lambda: self.session_command("project.revoke")),
             ],
         )
+        self.buttons(
+            projects,
+            [("设为只读", lambda: self.set_policy(False)), ("允许编辑", lambda: self.set_policy(True))],
+        )
         tasks = self.page("任务")
         self.tasks = QListWidget()
         tasks.addWidget(self.tasks)
@@ -328,6 +332,13 @@ class Window(QMainWindow):
         n = self.sessions.currentRow()
         if n >= 0 and self.ask("已核对终端和项目，继续执行此操作？"):
             self.call(op, dict(sid=self.snap["sessions"][n]["sid"], **self.revision()))
+
+    def set_policy(self, edit):
+        n = self.sessions.currentRow()
+        if n >= 0 and self.ask("更新该项目所有会话的工具权限？已冻结任务需重新核验权限。"):
+            self.call(
+                "project.set_policy", dict(sid=self.snap["sessions"][n]["sid"], edit=edit, **self.revision())
+            )
 
     def task_command(self, op, cb=None):
         n = self.tasks.currentRow()

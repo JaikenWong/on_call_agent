@@ -152,3 +152,37 @@ async def test_old_reply_not_delivered_after_repairing_same_person(engine):
     await engine.deliver_one()
     assert engine.api.reply_text.await_count == 0
     assert s.db.execute("SELECT status FROM replies").fetchone()[0] == "revoked"
+
+
+async def test_held_edit_task_cannot_resume_with_downgraded_permissions(engine):
+    s = engine.store
+    sid = s.get("sid")
+    with s.db:
+        await engine.command("project.set_policy", {"sid": sid, "edit": True})
+    s.accept(OWNER, "edit", "change file", [])
+    s.recover()
+    with s.db:
+        await engine.command("session.acquire", {"sid": sid})
+        await engine.command("project.set_policy", {"sid": sid, "edit": False})
+    with pytest.raises(ValueError, match="检查身份"):
+        await engine.command("task.resume_held", {"task_no": 1})
+    assert s.task(1)["state"] == "held"
+
+
+async def test_progress_patch_failure_cannot_abort_query(engine, tmp_path, monkeypatch):
+    import sys
+
+    child = tmp_path / "progress.py"
+    child.write_text(
+        "import json,sys\njson.loads(sys.stdin.buffer.readline())\n"
+        "print(json.dumps({'progress':'AssistantMessage'}),flush=True)\n"
+        "print(json.dumps({'state':'succeeded','result':'done'}),flush=True)\n"
+    )
+    monkeypatch.setattr("oncall_bot.desktop.engine.launch_args", lambda _: [sys.executable, str(child)])
+    monkeypatch.setattr("oncall_bot.desktop.engine.PROGRESS_INTERVAL", 0)
+    engine.api = NS(reply_card=AsyncMock(return_value="card"), patch_card=AsyncMock(side_effect=TimeoutError))
+    engine.store.accept(OWNER, "message", "inspect", [])
+    await engine.execute(engine.store.task(1))
+    assert engine.api.patch_card.await_count == 1
+    assert engine.store.task(1)["state"] == "succeeded"
+    assert engine.active_task_id is None
