@@ -61,7 +61,9 @@ def done_card(
     num_turns: int | None,
     tokens: int | None,
     short_session_id: str,
+    part: tuple[int, int] | None = None,
 ) -> dict:
+    """完成卡片。回答被拆成多张时，part=(第几张, 共几张)，统计信息只放在最后一张上。"""
     bits: list[str] = []
     if duration_ms is not None:
         bits.append(f"耗时 {_fmt_duration(duration_ms / 1000)}")
@@ -70,11 +72,30 @@ def done_card(
     if tokens is not None:
         bits.append(f"{tokens} tokens")
     bits.append(f"会话 {short_session_id}")
+    if part is not None:
+        bits.append(f"共 {part[1]} 张")
     return _shell(
-        f"完成 · {repo_name}",
+        f"完成 · {repo_name}{_part_suffix(part)}",
         TEMPLATE_DONE,
         [_markdown(body), _divider(), _note(" · ".join(bits))],
     )
+
+
+def part_card(repo_name: str, body: str, *, index: int, total: int) -> dict:
+    """回答被拆成多张时，除最后一张以外的那些。"""
+    return _shell(
+        f"完成 · {repo_name}{_part_suffix((index, total))}",
+        TEMPLATE_DONE,
+        [
+            _markdown(body),
+            _divider(),
+            _note(f"回答较长，分 {total} 张卡片发出 · 接着看第 {index + 1} 张"),
+        ],
+    )
+
+
+def _part_suffix(part: tuple[int, int] | None) -> str:
+    return f"（{part[0]}/{part[1]}）" if part is not None else ""
 
 
 def aborted_card(repo_name: str, body: str, reason: str, *, short_session_id: str) -> dict:

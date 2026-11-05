@@ -474,6 +474,10 @@ async def run_checks(cfg: Config, session_id: str) -> None:
     print("\n== 10. 飞书消息里的图片和文件 ==")
     await check_attachments(cfg)
 
+    # ---------- 11. 长回答拆成多张卡片 ----------
+    print("\n== 11. 长回答拆成多张卡片 ==")
+    check_card_split()
+
 
 async def check_attachments(cfg: Config) -> None:
     from oncall_bot.attachments import (
@@ -856,6 +860,74 @@ async def check_new_session(cfg: Config, state: StateStore) -> None:
         if get_session_info(new_id, WORKDIR) is not None:
             delete_session(new_id, directory=WORKDIR)
             print(f"  已清理新建的会话 {new_id[:8]}")
+
+
+def check_card_split() -> None:
+    from oncall_bot.config import RenderConfig
+    from oncall_bot.feishu import cards
+    from oncall_bot.runner.render import split_for_cards, to_feishu_markdown
+
+    fence = "`" * 3
+
+    # 11.1 短回答不拆
+    check("短回答只有一段", split_for_cards("就这一句", 5500, 6) == ["就这一句"])
+    check("空回答没有段", split_for_cards("   ", 5500, 6) == [])
+
+    # 11.2 按行拆：不丢行、每段不超上限
+    text = "\n".join(f"第 {i} 行内容内容内容" for i in range(1, 61))
+    segs = split_for_cards(text, 300, 6)
+    check("长回答被拆成多段", len(segs) > 1, f"segs={len(segs)}")
+    check("每段都不超过上限", all(len(s) <= 300 for s in segs), str([len(s) for s in segs]))
+    check("一行都没丢", sum(s.count("第") for s in segs) == 60)
+
+    # 11.3 代码围栏跨段：下一段补开头，转换时补收尾
+    body = (
+        f"before\n\n{fence}python\n"
+        + "\n".join(f"line_{i} = {i}" for i in range(40))
+        + f"\n{fence}\nafter"
+    )
+    segs = split_for_cards(body, 260, 6)
+    check("代码块被拆成多段", len(segs) > 1, f"segs={len(segs)}")
+    check(
+        "后续段开头补回了围栏",
+        all(s.lstrip().startswith(f"{fence}python") for s in segs[1:]),
+        segs[1].splitlines()[0],
+    )
+    check(
+        "每段转换后围栏都成对闭合",
+        all(to_feishu_markdown(s).count(fence) % 2 == 0 for s in segs),
+    )
+    check("代码行一个没丢", sum(s.count("line_") for s in segs) == 40)
+    check("围栏后面的正文还在", "after" in segs[-1])
+
+    # 11.4 超过 max_result_cards 就截断并说明
+    capped = split_for_cards("x" * 5000, 300, 3)
+    check("卡片数量受上限约束", len(capped) == 3, f"segs={len(capped)}")
+    check("截断有明确说明", "省略了末尾约" in capped[-1], capped[-1][-40:])
+
+    # 11.5 卡片标题带张数，统计信息只在最后一张
+    part = cards.part_card("repo", "正文", index=1, total=3)
+    check("非末张标题带序号", part["header"]["title"]["content"] == "完成 · repo（1/3）")
+    check("非末张提示接着看下一张", "第 2 张" in part["elements"][-1]["elements"][0]["content"])
+    last = cards.done_card(
+        "repo", "正文", duration_ms=1000, num_turns=2, tokens=3, short_session_id="abcdef12", part=(3, 3)
+    )
+    check("末张标题带序号", last["header"]["title"]["content"] == "完成 · repo（3/3）")
+    footer = last["elements"][-1]["elements"][0]["content"]
+    check("末张带统计信息", "耗时" in footer and "2 轮" in footer, footer)
+    check("单张时标题不带序号", cards.done_card(
+        "repo", "正文", duration_ms=None, num_turns=None, tokens=None, short_session_id="abcdef12"
+    )["header"]["title"]["content"] == "完成 · repo")
+
+    # 11.6 配置：单张容量超过卡片上限时收敛，而不是报错
+    clamped = RenderConfig(max_card_chars=1000, result_inline_max=2000)
+    check(
+        "result_inline_max 超过 max_card_chars 时被收敛",
+        clamped.result_inline_max == 1000,
+        str(clamped.result_inline_max),
+    )
+    check("默认值已调大", RenderConfig().result_inline_max == 5500)
+    check("默认最多 6 张", RenderConfig().max_result_cards == 6)
 
 
 def check_markdown() -> None:

@@ -33,13 +33,12 @@ from ..feishu.api import FeishuApi
 from ..feishu.parser import IncomingMessage
 from ..state import ActiveSession, CardRef, StateStore
 from .connection import SessionConnection
-from .render import TurnRenderer, clip_tail, to_feishu_markdown, total_tokens
+from .render import TurnRenderer, split_for_cards, to_feishu_markdown, total_tokens
 from .turn_stream import TurnStream
 
 log = logging.getLogger(__name__)
 
 MONITOR_INTERVAL = 5.0
-RESULT_INLINE_MAX = 2500
 
 
 @dataclass
@@ -322,7 +321,6 @@ class SessionRunner:
         active: ActiveSession,
         result: ResultMessage | None,
     ) -> None:
-        msg = handle.msg
         renderer = handle._renderer
         if renderer is None:
             log.error("本轮 %s 没有 renderer，无法定稿卡片", handle.tag)
@@ -351,14 +349,15 @@ class SessionRunner:
 
         await self._state.touch_active()
 
+        cfg = self._cfg.render
         body = renderer.body
         final = (renderer.final_result or "").strip()
-        # final 是模型原文，也要过一遍飞书 markdown 转换（body 已经过了）
-        inline = (
-            to_feishu_markdown(clip_tail(final, self._cfg.render.max_card_chars))
-            if final and len(final) <= RESULT_INLINE_MAX
-            else body
-        )
+        # 回答超过 result_inline_max 就按这个尺寸拆成多张卡片，不再用纯文本补发全文：
+        # 以前那样是卡片 + 文字各一条，同一个答案看起来回了两遍。
+        segments = split_for_cards(final, cfg.result_inline_max, cfg.max_result_cards)
+        # final 是模型原文，也要过一遍飞书 markdown 转换（body 已经过了）。
+        # 没有 final（模型没返回结果文本）时退回整轮流式正文。
+        inline = to_feishu_markdown(segments[0]) if len(segments) == 1 else body
         if handle.background_note:
             inline = f"*{handle.background_note}*\n\n{inline}"
 
@@ -380,6 +379,10 @@ class SessionRunner:
             )
             return
 
+        if len(segments) > 1:
+            await self._finish_in_parts(handle, active, result, segments)
+            return
+
         await self._finalize(
             handle,
             cards.done_card(
@@ -392,9 +395,45 @@ class SessionRunner:
             ),
         )
 
-        # 结果过长时卡片放摘要，全文用文字消息补发
-        if final and len(final) > RESULT_INLINE_MAX:
-            await self._api.reply_long_text(msg.message_id, final, in_thread=msg.in_thread)
+    async def _finish_in_parts(
+        self,
+        handle: TurnHandle,
+        active: ActiveSession,
+        result: ResultMessage,
+        segments: list[str],
+    ) -> None:
+        """回答太长：运行中那张卡片定稿成第 1 张，其余作为新卡片补发。
+
+        统计信息（耗时 / 轮数 / tokens）放在最后一张上 —— 读到那里才算读完。
+        """
+        msg = handle.msg
+        total = len(segments)
+        first = to_feishu_markdown(segments[0])
+        if handle.background_note:
+            first = f"*{handle.background_note}*\n\n{first}"
+        await self._finalize(
+            handle, cards.part_card(active.repo_name, first, index=1, total=total)
+        )
+
+        for index, segment in enumerate(segments[1:], start=2):
+            text = to_feishu_markdown(segment)
+            if index == total:
+                card = cards.done_card(
+                    active.repo_name,
+                    text,
+                    duration_ms=result.duration_ms,
+                    num_turns=result.num_turns,
+                    tokens=total_tokens(result.usage),
+                    short_session_id=active.short_id,
+                    part=(index, total),
+                )
+            else:
+                card = cards.part_card(active.repo_name, text, index=index, total=total)
+            sent = await self._api.reply_card(msg.message_id, card, in_thread=msg.in_thread)
+            if sent is None:
+                log.error("第 %d/%d 张卡片发送失败，后面的不再发", index, total)
+                return
+        log.info("本轮 %s 的回答分 %d 张卡片发出", handle.tag, total)
 
     async def _finish_aborted(self, handle: TurnHandle, active: ActiveSession) -> None:
         """连接都还没建立就被中断的收尾。没有模型输出，只有一句原因。"""

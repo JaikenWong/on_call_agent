@@ -175,6 +175,61 @@ def _inline_code(text: str) -> str:
     return _INLINE_CODE_RE.sub(_INLINE_CODE_SUB, text)
 
 
+def split_for_cards(text: str, max_chars: int, max_cards: int) -> list[str]:
+    """最终回答 → 多段卡片正文（仍是原始 markdown，调用方再过 to_feishu_markdown）。
+
+    按行切，尽量不把一行劈开（单行本身超长时才硬切）。代码围栏跨段时，
+    下一段开头补回围栏开头行 —— 收尾由 to_feishu_markdown 负责，
+    否则后半段代码会被当成正文渲染。
+
+    超过 max_cards 段就截掉尾部，并在最后一段说明省略了多少字：
+    宁可少发几张卡片，也不要在飞书里刷屏。
+    """
+    body = (text or "").strip()
+    if not body:
+        return []
+    if len(body) <= max_chars:
+        return [body]
+
+    # 给补回的围栏开头行和省略说明留点余量
+    budget = max(200, max_chars - 80)
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    length = 0
+    opener = ""  # 当前位置若在围栏内部，这是它的开头行
+    carry = ""  # 新一段开头要补的围栏开头行
+
+    for raw in body.split("\n"):
+        for line in _hard_split(raw, budget):
+            if current and length + len(line) + 1 > budget:
+                chunks.append(current)
+                carry = opener
+                current = [carry] if carry else []
+                length = (len(carry) + 1) if carry else 0
+            current.append(line)
+            length += len(line) + 1
+            if line.strip().startswith("```"):
+                opener = "" if opener else (line.rstrip() or "```")
+    if current:
+        chunks.append(current)
+
+    if len(chunks) > max_cards:
+        dropped = sum(len("\n".join(chunk)) for chunk in chunks[max_cards:])
+        chunks = chunks[:max_cards]
+        chunks[-1].extend(
+            ["", f"*（回答过长，这里省略了末尾约 {dropped} 字；完整内容在本机会话历史里）*"]
+        )
+
+    return ["\n".join(chunk) for chunk in chunks]
+
+
+def _hard_split(line: str, size: int) -> list[str]:
+    """单行超过一张卡片的容量时只能硬切（通常是压在一行里的长 JSON / base64）。"""
+    if len(line) <= size:
+        return [line]
+    return [line[i : i + size] for i in range(0, len(line), size)]
+
+
 def clip_tail(text: str, max_chars: int) -> str:
     """超长时保留尾部，开头标注已截断。"""
     if len(text) <= max_chars:

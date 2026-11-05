@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+log = logging.getLogger(__name__)
 
 PermissionMode = Literal["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"]
 SettingSource = Literal["user", "project", "local"]
@@ -83,8 +93,30 @@ class RunnerConfig(BaseModel):
 
 class RenderConfig(BaseModel):
     update_interval_ms: int = Field(default=1200, ge=200)
+    # 单张卡片正文的字数上限。飞书卡片本身有体积限制，别调太大
     max_card_chars: int = Field(default=6000, ge=500)
+    # 最终回答一张卡片最多装多少字：不超过就一张发完，超过就按这个尺寸拆成多张。
+    # 比 max_card_chars 留一点余量，给「带了 N 个附件」这类附注腾地方
+    result_inline_max: int = Field(default=5500, ge=500)
+    # 回答再长也最多拆这么多张卡片，多出来的截掉并在最后一张上说明
+    max_result_cards: int = Field(default=6, ge=1, le=20)
     session_list_limit: int = Field(default=10, gt=0, le=50)
+
+    @model_validator(mode="after")
+    def _inline_fits_card(self) -> RenderConfig:
+        """单张卡片装不下的回答长度没有意义，收敛到 max_card_chars。
+
+        不报错而是收敛：只调小 max_card_chars 的人不该被迫连 result_inline_max
+        一起改，而放任它更大会让单卡路径把回答开头截掉。
+        """
+        if self.result_inline_max > self.max_card_chars:
+            log.warning(
+                "result_inline_max（%d）大于 max_card_chars（%d），已按后者处理",
+                self.result_inline_max,
+                self.max_card_chars,
+            )
+            self.result_inline_max = self.max_card_chars
+        return self
 
 
 class DocsConfig(BaseModel):

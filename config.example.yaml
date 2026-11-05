@@ -53,7 +53,13 @@ runner:
 
 render:
   update_interval_ms: 1200
+  # 单张卡片正文的字数上限。飞书卡片本身有体积限制，别调太大
   max_card_chars: 6000
+  # 最终回答一张卡片最多装多少字：不超过就一张发完，
+  # 超过就按这个尺寸拆成多张卡片。比 max_card_chars 大会被收敛成后者
+  result_inline_max: 5500
+  # 回答再长也最多拆这么多张，多出来的截掉并在最后一张上说明
+  max_result_cards: 6
   session_list_limit: 10
 
 docs:
