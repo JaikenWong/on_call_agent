@@ -203,3 +203,16 @@ def test_upgrade_seeds_task_counter_from_retained_input_keys(engine):
         assert upgraded.db.execute("SELECT id FROM tasks").fetchone()[0] > 2
     finally:
         upgraded.db.close()
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX process-group behavior")
+async def test_exited_child_is_not_signalled_again(monkeypatch):
+    from oncall_bot.desktop.process import terminate
+    import os
+
+    signal_group = AsyncMock()
+    monkeypatch.setattr(os, "killpg", signal_group)
+    proc = NS(pid=56789, returncode=0, wait=AsyncMock(return_value=0))
+    await terminate(proc)
+    signal_group.assert_not_called()
+    proc.wait.assert_awaited_once()

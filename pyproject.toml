@@ -1,6 +1,6 @@
 [project]
 name = "oncall-bot"
-version = "0.1.2"
+version = "0.1.3"
 description = "飞书 ↔ Claude Code 会话桥（全局单活跃会话）"
 requires-python = ">=3.12"
 dependencies = [

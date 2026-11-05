@@ -15,7 +15,7 @@ async def terminate(proc):
             proc.windows_job = None
         elif proc.returncode is None:
             proc.kill()
-    else:
+    elif proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
     await proc.wait()

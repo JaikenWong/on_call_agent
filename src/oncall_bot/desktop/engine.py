@@ -44,6 +44,8 @@ def alive(group):
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # Access denied cannot prove an old execution group is gone.
 
 
 class Engine:
@@ -338,6 +340,11 @@ class Engine:
     def require_idle(self):
         if self.active_task_id is not None:
             raise ValueError("BUSY：任务正在执行或收尾")
+        if any(
+            alive(r[0])
+            for r in self.db.execute("SELECT pid FROM tasks WHERE state='unknown' AND pid IS NOT NULL")
+        ):
+            raise ValueError("BUSY：先核对遗留执行进程")
         self.store.idle()
 
     def valid(self, snap, resumed_rev=None):
@@ -510,7 +517,7 @@ class Engine:
             if proc:
                 # The process group is created by this engine, never by a user's terminal.
                 await terminate(proc)
-                if not alive(proc.pid):
+                if proc.returncode == 0 or not alive(proc.pid):
                     with self.db:
                         self.db.execute("UPDATE tasks SET pid=NULL WHERE pid=?", (proc.pid,))
                 self.process = None
