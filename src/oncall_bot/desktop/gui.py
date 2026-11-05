@@ -1,4 +1,9 @@
-"""Qt owns the window and its child engine. All actions return over the pipe."""
+"""Qt owns the window and its child engine. All actions return over the pipe.
+
+界面结构：左侧导航 + 右侧页面栈，顶部一条常驻状态条。
+原来是三个标签页、每页平铺十来个等宽按钮，看不出主次；现在每页最多一个主按钮，
+危险操作单独描红，列表改成带列头的表格。IPC 协议和 op 名称一个都没动。
+"""
 
 import hashlib
 import json
@@ -7,14 +12,17 @@ import shutil
 import sys
 import uuid
 
-from PySide6.QtCore import QLockFile, QProcess, QTimer
+from PySide6.QtCore import QLockFile, QProcess, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QFileDialog,
-    QFormLayout,
+    QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -23,145 +31,403 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QStyle,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStackedWidget,
     QSystemTrayIcon,
-    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
+from . import theme
 from .runtime import data_root, launch_args
+
+NAV_ITEMS = ("会话", "任务", "设置")
+
+
+def button(label, handler, kind="secondary", tip=""):
+    widget = QPushButton(label)
+    widget.setProperty("kind", kind)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.clicked.connect(lambda _checked=False: handler())
+    if tip:
+        widget.setToolTip(tip)
+    return widget
+
+
+def row(*widgets, stretch_at_end=True):
+    """一排按钮。默认右侧留白，这样按钮不会被拉成等宽。"""
+    holder = QWidget()
+    holder.setObjectName("plain")  # 透明，否则在白卡片上会显示成灰底色带
+    layout = QHBoxLayout(holder)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    for widget in widgets:
+        layout.addWidget(widget)
+    if stretch_at_end:
+        layout.addStretch()
+    return holder
+
+
+class Card(QFrame):
+    """带标题的白底卡片。用它给页面分区，替代原来一坨平铺控件。"""
+
+    def __init__(self, title="", hint=""):
+        super().__init__()
+        self.setObjectName("card")
+        self.body = QVBoxLayout(self)
+        self.body.setContentsMargins(16, 14, 16, 14)
+        self.body.setSpacing(10)
+        if title:
+            label = QLabel(title)
+            label.setObjectName("cardTitle")
+            self.body.addWidget(label)
+        if hint:
+            note = QLabel(hint)
+            note.setObjectName("cardHint")
+            note.setWordWrap(True)
+            self.body.addWidget(note)
+
+    def add(self, widget):
+        self.body.addWidget(widget)
+        return widget
+
+    def add_field(self, label, widget, trailing=None):
+        """一行表单：左侧固定宽度的标签 + 输入框（可选尾部按钮）。"""
+        holder = QWidget()
+        holder.setObjectName("plain")
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        name = QLabel(label)
+        name.setMinimumWidth(96)
+        name.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(name)
+        layout.addWidget(widget, 1)
+        if trailing is not None:
+            layout.addWidget(trailing)
+        self.body.addWidget(holder)
+        return widget
+
+
+class Table(QTableWidget):
+    def __init__(self, headers, stretch_column):
+        super().__init__(0, len(headers))
+        self.setHorizontalHeaderLabels(headers)
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setShowGrid(False)
+        self.setWordWrap(False)
+        self.setAlternatingRowColors(False)
+        header = self.horizontalHeader()
+        header.setHighlightSections(False)
+        for index in range(len(headers)):
+            mode = (
+                QHeaderView.ResizeMode.Stretch
+                if index == stretch_column
+                else QHeaderView.ResizeMode.ResizeToContents
+            )
+            header.setSectionResizeMode(index, mode)
+
+    def fill(self, rows, columns):
+        """rows 是快照里的字典列表，columns 是 (取值函数, 颜色函数|None) 列表。"""
+        self.setRowCount(len(rows))
+        for r, record in enumerate(rows):
+            for c, (getter, colorer) in enumerate(columns):
+                item = QTableWidgetItem(str(getter(record)))
+                if colorer is not None:
+                    tint = colorer(record)
+                    if tint:
+                        item.setForeground(QColor(tint))
+                self.setItem(r, c, item)
+
+
+def state_color(value):
+    return theme.STATE_COLORS.get(str(value), theme.TEXT)
+
+
+def dot_icon(color, size=16):
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(2, 2, size - 4, size - 4)
+    painter.end()
+    return pixmap
+
+
+class StatusStrip(QFrame):
+    """常驻状态条：引擎 / 接单 / 当前会话，右侧一个暂停开关。"""
+
+    def __init__(self, on_toggle_pause):
+        super().__init__()
+        self.setObjectName("statusBarCard")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        self.dot = QLabel()
+        self.dot.setFixedSize(12, 12)
+        layout.addWidget(self.dot)
+
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        self.main = QLabel("引擎启动中")
+        self.main.setObjectName("statusMain")
+        self.meta = QLabel("—")
+        self.meta.setObjectName("statusMeta")
+        texts.addWidget(self.main)
+        texts.addWidget(self.meta)
+        layout.addLayout(texts, 1)
+
+        self.pause = button("暂停接单", on_toggle_pause)
+        layout.addWidget(self.pause)
+        self.set_state(theme.MUTED, "引擎启动中", "正在连接本机引擎")
+
+    def set_state(self, color, main, meta):
+        self.dot.setPixmap(dot_icon(color, 12))
+        self.main.setText(main)
+        self.meta.setText(meta)
 
 
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("飞书值班助手")
-        self.resize(800, 560)
+        self.resize(940, 640)
+        self.setMinimumSize(820, 560)
         self.snap = {}
         self.pending = {}
         self.buffer = b""
         self.quitting = False
         self.restarts = 0
+        self.suppress_selection = False
+
         self.proc = QProcess(self)
         self.proc.readyReadStandardOutput.connect(self.read)
         self.proc.readyReadStandardError.connect(self.drain_error)
         self.proc.finished.connect(self.finished)
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        setup = self.page("接入与配对")
-        self.health = QLabel("引擎启动中")
-        setup.addWidget(self.health)
-        form = QFormLayout()
-        setup.addLayout(form)
-        self.app_id = QLineEdit()
-        self.secret = QLineEdit()
-        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self.cli = QLineEdit(shutil.which("claude") or "")
-        self.docs = QCheckBox("允许读取消息链接中的飞书文档")
-        form.addRow("应用 ID", self.app_id)
-        form.addRow("应用 Secret", self.secret)
-        form.addRow("Claude CLI", self.cli)
-        setup.addWidget(self.docs)
-        self.buttons(setup, [("选择 CLI", self.pick_cli), ("保存并连接", self.configure)])
-        self.buttons(
-            setup,
-            [
-                (
-                    "CLI 自检",
-                    lambda: self.call(
-                        "setup.check",
-                        {"cli": self.cli.text()},
-                        lambda v: QMessageBox.information(self, "CLI", v),
-                    ),
-                ),
-                ("导入旧配置", self.import_old),
-                ("导出诊断", self.export_diag),
-                ("清理过期数据", lambda: self.call("storage.clean")),
-            ],
-        )
-        self.pair = QLineEdit()
-        self.pair.setReadOnly(True)
-        setup.addWidget(self.pair)
-        self.owner = QLabel()
-        self.owner.setWordWrap(True)
-        setup.addWidget(self.owner)
-        self.buttons(
-            setup,
-            [
-                ("生成配对命令", lambda: self.call("pair.begin", {}, self.pair.setText)),
-                ("确认配对身份", self.confirm_pair),
-                ("解绑", self.revoke),
-            ],
-        )
-        setup.addStretch()
-        projects = self.page("项目与会话")
-        projects.addWidget(QLabel("接管前请先结束终端里的同一会话。释放后才可在终端续接。"))
-        self.sessions = QListWidget()
-        projects.addWidget(self.sessions)
-        self.buttons(
-            projects,
-            [
-                ("新建会话", lambda: self.register(False)),
-                ("接管已有历史", lambda: self.register(True)),
-                ("接管选中项", lambda: self.session_command("session.acquire")),
-                ("释放", lambda: self.call("session.release", self.revision())),
-            ],
-        )
-        self.buttons(
-            projects,
-            [
-                ("已核对异常", lambda: self.session_command("session.review")),
-                ("撤销项目授权", lambda: self.session_command("project.revoke")),
-            ],
-        )
-        self.buttons(
-            projects,
-            [("设为只读", lambda: self.set_policy(False)), ("允许编辑", lambda: self.set_policy(True))],
-        )
-        tasks = self.page("任务")
-        self.tasks = QListWidget()
-        tasks.addWidget(self.tasks)
-        self.detail = QTextBrowser()
-        tasks.addWidget(self.detail)
-        self.buttons(
-            tasks,
-            [
-                ("查看", self.show_task),
-                ("取消", lambda: self.task_command("task.cancel")),
-                ("补发", lambda: self.task_command("delivery.retry")),
-                ("恢复冻结任务", lambda: self.task_command("task.resume_held")),
-            ],
-        )
-        self.buttons(
-            tasks,
-            [("暂停接单", lambda: self.call("app.pause")), ("恢复接单", lambda: self.call("app.resume"))],
-        )
-        self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), self)
+
+        self.pages = QStackedWidget()
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.setFixedWidth(148)
+        self.nav.addItems(NAV_ITEMS)
+        # QListWidget 的行高只认 sizeHint，QSS 里 ::item 的 padding 撑不开它
+        for index in range(self.nav.count()):
+            self.nav.item(index).setSizeHint(QSize(0, 42))
+        # 三个固定项，不该出现滚动；切页时 autoScroll 会把第一项顶出可视区
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.nav.setAutoScroll(False)
+        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+
+        self.status_strip = StatusStrip(self.toggle_pause)
+
+        right = QVBoxLayout()
+        right.setContentsMargins(18, 16, 18, 16)
+        right.setSpacing(14)
+        right.addWidget(self.status_strip)
+        right.addWidget(self.pages, 1)
+        right_holder = QWidget()
+        right_holder.setLayout(right)
+
+        shell = QHBoxLayout()
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        shell.addWidget(self.nav)
+        shell.addWidget(right_holder, 1)
+        central = QWidget()
+        central.setLayout(shell)
+        self.setCentralWidget(central)
+
+        self.pages.addWidget(self.build_sessions_page())
+        self.pages.addWidget(self.build_tasks_page())
+        self.pages.addWidget(self.build_setup_page())
+        self.nav.setCurrentRow(0)
+
+        self.tray = QSystemTrayIcon(QIcon(dot_icon(theme.MUTED, 32)), self)
         menu = QMenu(self)
         menu.addAction("显示窗口", self.reopen)
         menu.addAction("退出应用", self.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda _: self.reopen())
         self.tray.show()
+
+        self.statusBar().showMessage("就绪")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1200)
         self.start()
 
-    def page(self, name):
-        page = QWidget()
-        self.tabs.addTab(page, name)
-        return QVBoxLayout(page)
+    # ---------- 页面 ----------
 
-    def buttons(self, layout, items):
-        row = QHBoxLayout()
-        layout.addLayout(row)
-        for label, func in items:
-            button = QPushButton(label)
-            button.clicked.connect(lambda checked=False, f=func: f())
-            row.addWidget(button)
+    def build_sessions_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        title = QLabel("会话")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        hint = QLabel("接管前请先结束终端里的同一会话；释放之后才能回到终端继续用。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.sessions = Table(["", "标题", "会话 ID", "项目路径"], 1)
+        layout.addWidget(self.sessions, 1)
+
+        layout.addWidget(
+            row(
+                button("新建会话", lambda: self.register(False), "primary", "选一个项目目录，开一条全新会话"),
+                button("接管已有历史", lambda: self.register(True), tip="接管终端里已经退出的历史会话"),
+            )
+        )
+
+        selected = Card(
+            "选中会话的操作",
+            "下面的操作都作用于表格里选中的那一行。",
+        )
+        selected.add(
+            row(
+                button("接管", lambda: self.session_command("session.acquire"), "primary"),
+                button("释放", lambda: self.call("session.release", self.revision())),
+                button("已核对异常", lambda: self.session_command("session.review")),
+            )
+        )
+        selected.add(
+            row(
+                button("设为只读", lambda: self.set_policy(False)),
+                button("允许编辑", lambda: self.set_policy(True)),
+                button("撤销项目授权", lambda: self.session_command("project.revoke"), "danger"),
+            )
+        )
+        layout.addWidget(selected)
+        return page
+
+    def build_tasks_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        title = QLabel("任务")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        self.tasks = Table(["#", "状态", "投递", "摘要"], 3)
+        self.tasks.itemSelectionChanged.connect(self.show_task)
+
+        self.detail = QTextBrowser()
+        self.detail.setPlaceholderText("选中一个任务查看详情")
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.tasks)
+        splitter.addWidget(self.detail)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, 1)
+
+        layout.addWidget(
+            row(
+                button("取消任务", lambda: self.task_command("task.cancel"), "danger"),
+                button("补发结果", lambda: self.task_command("delivery.retry")),
+                button("恢复冻结任务", lambda: self.task_command("task.resume_held")),
+            )
+        )
+        return page
+
+    def build_setup_page(self):
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        title = QLabel("设置")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        access = Card("接入", "飞书应用凭据与本机 Claude CLI。Secret 保存后不回显。")
+        self.app_id = QLineEdit()
+        self.app_id.setPlaceholderText("cli_ 开头的应用 ID")
+        self.secret = QLineEdit()
+        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.secret.setPlaceholderText("留空表示不修改")
+        self.cli = QLineEdit(shutil.which("claude") or "")
+        self.cli.setPlaceholderText("claude 可执行文件路径")
+        access.add_field("应用 ID", self.app_id)
+        access.add_field("应用 Secret", self.secret)
+        access.add_field("Claude CLI", self.cli, button("浏览…", self.pick_cli, "ghost"))
+        self.docs = QCheckBox("允许读取消息链接中的飞书文档")
+        access.add(self.docs)
+        access.add(
+            row(
+                button("保存并连接", self.configure, "primary"),
+                button(
+                    "CLI 自检",
+                    lambda: self.call(
+                        "setup.check",
+                        {"cli": self.cli.text()},
+                        lambda v: QMessageBox.information(self, "CLI 自检", str(v)),
+                    ),
+                ),
+            )
+        )
+        layout.addWidget(access)
+
+        pairing = Card("配对", "把一条飞书私聊认成「本人」，之后只有这个人能驱动会话。")
+        self.pair = QLineEdit()
+        self.pair.setReadOnly(True)
+        self.pair.setPlaceholderText("点「生成配对命令」后，把这行命令发给机器人")
+        pairing.add_field("配对命令", self.pair, button("复制", self.copy_pair, "ghost"))
+        self.owner = QLabel("本人：未配对")
+        self.owner.setObjectName("cardHint")
+        self.owner.setWordWrap(True)
+        self.candidate = QLabel("候选：无")
+        self.candidate.setObjectName("cardHint")
+        self.candidate.setWordWrap(True)
+        pairing.add(self.owner)
+        pairing.add(self.candidate)
+        pairing.add(
+            row(
+                button("生成配对命令", lambda: self.call("pair.begin", {}, self.pair.setText), "primary"),
+                button("确认配对身份", self.confirm_pair),
+                button("解绑", self.revoke, "danger"),
+            )
+        )
+        layout.addWidget(pairing)
+
+        upkeep = Card("维护")
+        upkeep.add(
+            row(
+                button("导入旧配置", self.import_old),
+                button("导出诊断", self.export_diag),
+                button("清理过期数据", lambda: self.call("storage.clean")),
+            )
+        )
+        layout.addWidget(upkeep)
+        layout.addStretch()
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(inner)
+        area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        return area
+
+    # ---------- 引擎管道（协议未改） ----------
 
     def start(self):
         args = launch_args("engine")
@@ -172,7 +438,9 @@ class Window(QMainWindow):
         raw = bytes(self.proc.readAllStandardError())
         if "已有引擎".encode() in raw:
             self.restarts = 3
-            self.health.setText("已有引擎运行，请使用原窗口或退出旧桥")
+            self.status_strip.set_state(
+                theme.DANGER, "已有引擎在运行", "请使用原窗口，或先退出旧的桥进程"
+            )
 
     def finished(self, *_):
         self.pending.clear()
@@ -181,7 +449,7 @@ class Window(QMainWindow):
             QApplication.instance().quit()
         elif self.restarts < 3:
             self.restarts += 1
-            self.health.setText("引擎异常，正在重新启动")
+            self.status_strip.set_state(theme.WARNING, "引擎异常", "正在重新启动")
             QTimer.singleShot(1000 * self.restarts, self.start)
 
     def refresh(self):
@@ -223,48 +491,97 @@ class Window(QMainWindow):
     def revision(self):
         return {"revision": self.snap.get("revision", 0)}
 
+    # ---------- 快照 → 界面 ----------
+
     def update_view(self, s):
         if not self.snap.get("app") and s["app"]:
             self.app_id.setText(s["app"])
             self.cli.setText(s["cli"])
             self.docs.setChecked(s["docs"])
-        self.health.setText(
-            f"{s['health']}  ·  {'暂停' if s['paused'] else '接单开启'}  ·  当前会话 {s['sid'] or '未接管'}"
+
+        paused = s["paused"]
+        healthy = "正常" in str(s["health"])
+        color = theme.WARNING if paused else (theme.SUCCESS if healthy else theme.DANGER)
+        self.status_strip.set_state(
+            color,
+            str(s["health"]) + ("（已暂停接单）" if paused else ""),
+            "当前会话 " + (s["sid"] or "未接管") + f"　·　{len(s['tasks'])} 个任务在列表里",
         )
-        self.tray.setToolTip(self.health.text())
-        self.owner.setText("本人：" + str(s["owner"] or "未配对") + "\n候选：" + str(s["candidate"] or "无"))
-        for widget, key, field, label in (
-            (self.sessions, "sessions", "sid", lambda r: f"{r['title']}  {r['sid']}  {r['path']}"),
-            (
+        self.status_strip.pause.setText("恢复接单" if paused else "暂停接单")
+        self.tray.setIcon(QIcon(dot_icon(color, 32)))
+        self.tray.setToolTip(self.status_strip.main.text())
+
+        self.owner.setText("本人：" + str(s["owner"] or "未配对"))
+        self.candidate.setText("候选：" + str(s["candidate"] or "无"))
+
+        active = s["sid"]
+        if self.snap.get("sessions") != s["sessions"]:
+            self.refill(
+                self.sessions,
+                s["sessions"],
+                "sid",
+                [
+                    (lambda r: "●" if r["sid"] == active else "", lambda r: theme.ACCENT),
+                    (lambda r: r["title"], None),
+                    (lambda r: r["sid"], None),
+                    (lambda r: r["path"], None),
+                ],
+            )
+        if self.snap.get("tasks") != s["tasks"]:
+            self.refill(
                 self.tasks,
-                "tasks",
+                s["tasks"],
                 "id",
-                lambda r: f"#{r['id']}  {r['state']}  ·  投递 {r['delivery']}  {r['summary']}",
-            ),
-        ):
-            if self.snap.get(key) != s[key]:
-                index = widget.currentRow()
-                previous = self.snap.get(key, [])
-                selected = previous[index][field] if 0 <= index < len(previous) else None
-                widget.clear()
-                widget.addItems([label(r) for r in s[key]])
-                for n, r in enumerate(s[key]):
-                    if r[field] == selected:
-                        widget.setCurrentRow(n)
+                [
+                    (lambda r: "#" + str(r["id"]), None),
+                    (lambda r: r["state"], lambda r: state_color(r["state"])),
+                    (lambda r: r["delivery"], lambda r: state_color(r["delivery"])),
+                    (lambda r: r["summary"], None),
+                ],
+            )
         self.snap = s
+
+    def refill(self, table, rows, key, columns):
+        """重建表格内容，但保住原来选中的那一行。
+
+        重建期间要屏蔽选中事件：selectRow 会触发任务详情加载，而那一刻 self.snap
+        还是旧快照，索引对不上就会去取错的任务。
+        """
+        index = table.currentRow()
+        previous = self.snap.get("sessions" if table is self.sessions else "tasks", [])
+        selected = previous[index][key] if 0 <= index < len(previous) else None
+        self.suppress_selection = True
+        try:
+            table.fill(rows, columns)
+            for n, record in enumerate(rows):
+                if record[key] == selected:
+                    table.selectRow(n)
+                    break
+        finally:
+            self.suppress_selection = False
+
+    # ---------- 动作 ----------
+
+    def toggle_pause(self):
+        self.call("app.resume" if self.snap.get("paused") else "app.pause")
 
     def pick_cli(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 Claude CLI")
         if path:
             self.cli.setText(path)
 
+    def copy_pair(self):
+        text = self.pair.text()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.statusBar().showMessage("配对命令已复制", 3000)
+
     def import_old(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择旧版配置", "", "YAML (*.yaml *.yml)")
 
         def preview(v):
-            if self.ask(
-                "导入应用与 CLI 设置？旧会话仅作为候选，需重新授权。\n" + json.dumps(v, ensure_ascii=False)
-            ):
+            summary = "\n".join(f"{k}：{v[k]}" for k in sorted(v))
+            if self.ask("导入应用与 CLI 设置？旧会话仅作为候选，需重新授权。\n\n" + summary):
                 self.app_id.setText(v["app"])
                 if v["cli"]:
                     self.cli.setText(v["cli"])
@@ -275,7 +592,7 @@ class Window(QMainWindow):
     def export_diag(self):
         def save(v):
             text = json.dumps(v, ensure_ascii=False, indent=2)
-            if self.ask("导出以下诊断信息？\n" + text):
+            if self.ask("导出以下诊断信息？\n\n" + text):
                 path, _ = QFileDialog.getSaveFileName(self, "导出诊断", "", "JSON (*.json)")
                 if path:
                     with open(path, "w", encoding="utf-8") as out:
@@ -297,7 +614,10 @@ class Window(QMainWindow):
 
     def confirm_pair(self):
         candidate = self.snap.get("candidate")
-        if candidate and self.ask("确认将该飞书私聊配对为本人？\n" + str(candidate)):
+        if not candidate:
+            QMessageBox.information(self, "配对", "还没有候选身份。先生成配对命令并在飞书里发给机器人。")
+            return
+        if self.ask("确认将该飞书私聊配对为本人？\n\n" + str(candidate)):
             self.call("pair.confirm", {"candidate": candidate})
 
     def revoke(self):
@@ -311,7 +631,7 @@ class Window(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择可信项目")
         if not path:
             return
-        edit = self.ask("允许在此项目内编辑文件？选择 No 将使用只读权限。")
+        edit = self.ask("允许在此项目内编辑文件？选「No」则只给只读权限。")
         params = dict(path=path, edit=edit, **self.revision())
         if not existing:
             self.call("session.new", params)
@@ -328,30 +648,61 @@ class Window(QMainWindow):
 
         self.call("session.discover", {"path": path}, choose)
 
+    def current_session(self):
+        """从表格自身读会话 ID，不靠「行号 + 快照」间接定位，避免两者不同步时取错行。"""
+        index = self.sessions.currentRow()
+        item = self.sessions.item(index, 2) if index >= 0 else None
+        return item.text() if item is not None else None
+
+    def current_task_no(self):
+        index = self.tasks.currentRow()
+        item = self.tasks.item(index, 0) if index >= 0 else None
+        if item is None:
+            return None
+        try:
+            return int(item.text().lstrip("#"))
+        except ValueError:
+            return None
+
     def session_command(self, op):
-        n = self.sessions.currentRow()
-        if n >= 0 and self.ask("已核对终端和项目，继续执行此操作？"):
-            self.call(op, dict(sid=self.snap["sessions"][n]["sid"], **self.revision()))
+        sid = self.current_session()
+        if sid is None:
+            self.statusBar().showMessage("先在表格里选中一条会话", 4000)
+            return
+        if self.ask("已核对终端和项目，继续执行此操作？"):
+            self.call(op, dict(sid=sid, **self.revision()))
 
     def set_policy(self, edit):
-        n = self.sessions.currentRow()
-        if n >= 0 and self.ask("更新该项目所有会话的工具权限？已冻结任务需重新核验权限。"):
-            self.call(
-                "project.set_policy", dict(sid=self.snap["sessions"][n]["sid"], edit=edit, **self.revision())
-            )
+        sid = self.current_session()
+        if sid is None:
+            self.statusBar().showMessage("先在表格里选中一条会话", 4000)
+            return
+        if self.ask("更新该项目所有会话的工具权限？已冻结任务需重新核验权限。"):
+            self.call("project.set_policy", dict(sid=sid, edit=edit, **self.revision()))
 
     def task_command(self, op, cb=None):
-        n = self.tasks.currentRow()
-        if n >= 0:
-            self.call(op, {"task_no": self.snap["tasks"][n]["id"]}, cb)
+        task_no = self.current_task_no()
+        if task_no is None:
+            self.statusBar().showMessage("先在表格里选中一个任务", 4000)
+            return
+        self.call(op, {"task_no": task_no}, cb)
 
     def show_task(self):
-        self.task_command(
+        if self.suppress_selection:
+            return
+        task_no = self.current_task_no()
+        if task_no is None:
+            return
+        self.call(
             "task.get",
+            {"task_no": task_no},
             lambda r: self.detail.setPlainText(
-                f"#{r['id']}  {r['state']}\n{r['snapshot']['path']}\n{r['snapshot']['text']}\n\n{r['result']}"
+                f"#{r['id']}　{r['state']}\n{r['snapshot']['path']}\n\n"
+                f"{r['snapshot']['text']}\n\n——\n\n{r['result']}"
             ),
         )
+
+    # ---------- 窗口生命周期 ----------
 
     def reopen(self):
         self.showNormal()
@@ -382,6 +733,7 @@ class Window(QMainWindow):
 
 def run():
     app = QApplication([])
+    theme.apply_theme(app)
     app.setQuitOnLastWindowClosed(False)
     root = data_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
