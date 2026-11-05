@@ -55,6 +55,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libopengl0 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-render-util0
+      - name: Build Intel macOS crypto with static OpenSSL
+        if: matrix.platform == 'macOS-x64'
+        env:
+          OPENSSL_STATIC: '1'
+        run: python -m pip install --no-cache-dir --no-binary=cryptography cryptography==50.0.2
+      - name: Verify Intel macOS crypto linkage
+        if: matrix.platform == 'macOS-x64'
+        shell: python
+        run: |
+          import subprocess
+          import cryptography.hazmat.bindings._rust as rust
+          output = subprocess.check_output(["otool", "-L", rust.__file__], text=True)
+          print(output)
+          assert "libssl" not in output and "libcrypto" not in output, "OpenSSL must be embedded"
       - name: Install build and test dependencies
         run: python -m pip install -e ".[desktop,bundle,dev]"
       - name: Test

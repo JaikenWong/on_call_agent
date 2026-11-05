@@ -72,6 +72,14 @@ class Store:
             with self.db:
                 self.db.execute("ALTER TABLE replies ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
 
+        if version and self.get("last_task_no") is None:
+            # Published v1 never purges input dedupe keys. Their high-water mark
+            # also covers task IDs whose completed rows were already retained away.
+            maximum = self.db.execute("SELECT coalesce(max(id),0) FROM inputs").fetchone()[0]
+            maximum = max(maximum, self.db.execute("SELECT coalesce(max(id),0) FROM tasks").fetchone()[0])
+            with self.db:
+                self.set("last_task_no", maximum)
+
     def get(self, key, default=None):
         row = self.db.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default

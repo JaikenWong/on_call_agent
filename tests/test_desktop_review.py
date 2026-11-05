@@ -186,3 +186,20 @@ async def test_progress_patch_failure_cannot_abort_query(engine, tmp_path, monke
     assert engine.api.patch_card.await_count == 1
     assert engine.store.task(1)["state"] == "succeeded"
     assert engine.active_task_id is None
+
+
+def test_upgrade_seeds_task_counter_from_retained_input_keys(engine):
+    s = engine.store
+    s.accept(OWNER, "first", "inspect", [])
+    s.accept(OWNER, "command", "/status", [])
+    with s.db:
+        s.db.execute("DELETE FROM deliveries")
+        s.db.execute("DELETE FROM tasks")
+        s.db.execute("DELETE FROM settings WHERE k='last_task_no'")
+        s.db.execute("PRAGMA user_version=1")
+    upgraded = Store(s.root)
+    try:
+        upgraded.accept(OWNER, "next", "inspect", [])
+        assert upgraded.db.execute("SELECT id FROM tasks").fetchone()[0] > 2
+    finally:
+        upgraded.db.close()

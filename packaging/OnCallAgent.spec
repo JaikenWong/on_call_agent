@@ -18,4 +18,4 @@ identity = os.environ.get("ONCALL_CODESIGN_IDENTITY") or None
 exe = EXE(pyz,a.scripts,[],exclude_binaries=True,name="OnCallAgent",console=False,codesign_identity=identity)
 coll = COLLECT(exe,a.binaries,a.datas,name="OnCallAgent")
 app = BUNDLE(coll,name="OnCallAgent.app",bundle_identifier="local.oncall.agent",
-             info_plist={"CFBundleDisplayName":"飞书值班助手","CFBundleShortVersionString":"0.1.1"})
+             info_plist={"CFBundleDisplayName":"飞书值班助手","CFBundleShortVersionString":"0.1.2"})
