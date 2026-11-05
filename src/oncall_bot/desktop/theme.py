@@ -181,7 +181,9 @@ QLineEdit:read-only {{
     color: {MUTED};
 }}
 
-/* 不要自定义 ::indicator：一旦覆盖就连原生勾号一起没了，只会剩个纯色方块 */
+/* 不要自定义 ::indicator：QSS 一旦接管这个子控件，原生勾号就不画了，只剩个纯色方块。
+   注意离屏渲染（QT_QPA_PLATFORM=offscreen，风格退化成 fusion）下方框本身也不画，
+   只画勾 —— 那是截图工具链的假象，真实 Windows 原生风格是正常的，别照着截图去改。 */
 QCheckBox {{
     spacing: 8px;
 }}
@@ -259,6 +261,52 @@ QStatusBar {{
 }}
 QStatusBar::item {{
     border: none;
+}}
+
+/* 分步引导：序号徽标 + 右侧状态胶囊 */
+QLabel[badge="done"] {{
+    background: {ACCENT};
+    color: #ffffff;
+    border-radius: 11px;
+    font-weight: 600;
+    qproperty-alignment: AlignCenter;
+}}
+QLabel[badge="todo"] {{
+    background: #e2e5ea;
+    color: {MUTED};
+    border-radius: 11px;
+    font-weight: 600;
+    qproperty-alignment: AlignCenter;
+}}
+QLabel[chip="done"] {{
+    background: #e7f6ec;
+    color: {SUCCESS};
+    border-radius: 10px;
+    padding: 3px 10px;
+}}
+QLabel[chip="active"] {{
+    background: {SELECTION};
+    color: {ACCENT};
+    border-radius: 10px;
+    padding: 3px 10px;
+}}
+QLabel[chip="todo"] {{
+    background: #f1f2f4;
+    color: {MUTED};
+    border-radius: 10px;
+    padding: 3px 10px;
+}}
+QLabel[chip="warn"] {{
+    background: #fdf2e4;
+    color: {WARNING};
+    border-radius: 10px;
+    padding: 3px 10px;
+}}
+QLabel[chip="error"] {{
+    background: #fdecec;
+    color: {DANGER};
+    border-radius: 10px;
+    padding: 3px 10px;
 }}
 
 QToolTip {{

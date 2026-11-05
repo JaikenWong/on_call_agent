@@ -140,6 +140,8 @@ class Engine:
     def snapshot(self):
         return {
             "health": self.health,
+            # 界面靠这个判断「长连接是否已建立」，不要让它去匹配 health 的中文文案
+            "connected": self.api is not None,
             "owner": self.store.get("owner"),
             "candidate": self.candidate,
             "sid": self.store.get("sid"),

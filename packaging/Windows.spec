@@ -13,6 +13,8 @@ a = Analysis(
 a.datas = [entry for entry in a.datas if "_bundled/" not in entry[0].replace("\\","/")]
 a.binaries = [entry for entry in a.binaries if "_bundled/" not in entry[0].replace("\\","/")]
 pyz = PYZ(a.pure)
-gui = EXE(pyz,a.scripts,[],exclude_binaries=True,name="OnCallAgent",console=False)
+# 图标由 scripts/export_icon.py 从 desktop/icon.py 的画法导出，改了画法要重跑
+gui = EXE(pyz,a.scripts,[],exclude_binaries=True,name="OnCallAgent",console=False,
+          icon=str(root / "packaging/OnCallAgent.ico"))
 engine = EXE(pyz,a.scripts,[],exclude_binaries=True,name="OnCallEngine",console=True)
 coll = COLLECT(gui,engine,a.binaries,a.datas,name="OnCallAgent")

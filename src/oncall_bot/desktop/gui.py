@@ -13,7 +13,7 @@ import sys
 import uuid
 
 from PySide6.QtCore import QLockFile, QProcess, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import theme
+from . import icon, theme
 from .runtime import data_root, launch_args
 
 NAV_ITEMS = ("会话", "任务", "设置")
@@ -114,6 +114,52 @@ class Card(QFrame):
         return widget
 
 
+def restyle(widget):
+    """改过动态属性后必须重新走一遍样式，否则 QSS 不生效。"""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+class StepCard(Card):
+    """带序号和完成状态的步骤卡。设置页按使用顺序排，而不是按引擎的 op 清单排。"""
+
+    def __init__(self, number, title, hint=""):
+        super().__init__()
+        header = QWidget()
+        header.setObjectName("plain")
+        bar = QHBoxLayout(header)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(10)
+
+        self.badge = QLabel(str(number))
+        self.badge.setProperty("badge", "todo")
+        self.badge.setFixedSize(22, 22)
+        bar.addWidget(self.badge)
+
+        label = QLabel(title)
+        label.setObjectName("cardTitle")
+        bar.addWidget(label)
+        bar.addStretch()
+
+        self.chip = QLabel("待完成")
+        self.chip.setProperty("chip", "todo")
+        bar.addWidget(self.chip)
+        self.body.insertWidget(0, header)
+
+        if hint:
+            note = QLabel(hint)
+            note.setObjectName("cardHint")
+            note.setWordWrap(True)
+            self.body.insertWidget(1, note)
+
+    def set_state(self, chip_text, chip_kind):
+        self.chip.setText(chip_text)
+        self.chip.setProperty("chip", chip_kind)
+        self.badge.setProperty("badge", "done" if chip_kind == "done" else "todo")
+        restyle(self.chip)
+        restyle(self.badge)
+
+
 class Table(QTableWidget):
     def __init__(self, headers, stretch_column):
         super().__init__(0, len(headers))
@@ -152,16 +198,40 @@ def state_color(value):
     return theme.STATE_COLORS.get(str(value), theme.TEXT)
 
 
-def dot_icon(color, size=16):
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor(color))
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawEllipse(2, 2, size - 4, size - 4)
-    painter.end()
-    return pixmap
+def describe_route(route, empty="未配对"):
+    """引擎里的身份是 [app_id, tenant, sender_open_id, chat_id, ""]。
+
+    原样 str() 出来是一串带引号的数组，界面上没法读，这里只摘出能辨认的字段。
+    """
+    if not route:
+        return empty
+    if isinstance(route, str):
+        return route
+    try:
+        sender = route[2] or "?"
+        chat = route[3] or "?"
+    except (IndexError, TypeError):
+        return str(route)
+    return f"{sender}（会话 {chat}）"
+
+
+# 引擎里 health 的取值是固定的几个中文串，这里映射成颜色和一句人话。
+# 不在界面里用「包含某个词」去猜，引擎改文案时这张表会直接对不上，比猜错好发现。
+HEALTH_VIEW = {
+    "未连接": (theme.MUTED, "未连接飞书"),
+    "应用身份已验证，等待飞书事件": (theme.ACCENT, "飞书长连接已建立"),
+    "已收到飞书事件": (theme.SUCCESS, "飞书长连接正常"),
+    "长连接结束，请重启": (theme.DANGER, "长连接已断开"),
+    "连接失败，请检查凭据与网络": (theme.DANGER, "连接失败"),
+    "飞书投递失败，请查看任务": (theme.WARNING, "结果投递失败"),
+}
+
+
+def health_view(health, connected):
+    known = HEALTH_VIEW.get(str(health))
+    if known:
+        return known
+    return (theme.ACCENT if connected else theme.MUTED, str(health))
 
 
 class StatusStrip(QFrame):
@@ -193,7 +263,7 @@ class StatusStrip(QFrame):
         self.set_state(theme.MUTED, "引擎启动中", "正在连接本机引擎")
 
     def set_state(self, color, main, meta):
-        self.dot.setPixmap(dot_icon(color, 12))
+        self.dot.setPixmap(icon.status_dot(color, 12))
         self.main.setText(main)
         self.meta.setText(meta)
 
@@ -254,7 +324,8 @@ class Window(QMainWindow):
         self.pages.addWidget(self.build_setup_page())
         self.nav.setCurrentRow(0)
 
-        self.tray = QSystemTrayIcon(QIcon(dot_icon(theme.MUTED, 32)), self)
+        self.setWindowIcon(icon.app_icon())
+        self.tray = QSystemTrayIcon(icon.tray_icon(theme.MUTED), self)
         menu = QMenu(self)
         menu.addAction("显示窗口", self.reopen)
         menu.addAction("退出应用", self.quit)
@@ -359,20 +430,30 @@ class Window(QMainWindow):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
-        access = Card("接入", "飞书应用凭据与本机 Claude CLI。Secret 保存后不回显。")
+        self.step_access = StepCard(
+            1,
+            "接入飞书与本机 CLI",
+            "填飞书自建应用的凭据和本机 claude 可执行文件路径，保存后引擎才会去建立长连接。\n"
+            "Secret 存进系统凭据库，不写配置文件；留空表示沿用上次保存的。",
+        )
         self.app_id = QLineEdit()
         self.app_id.setPlaceholderText("cli_ 开头的应用 ID")
         self.secret = QLineEdit()
         self.secret.setEchoMode(QLineEdit.EchoMode.Password)
         self.secret.setPlaceholderText("留空表示不修改")
+        self.secret_eye = button("显示", self.toggle_secret, "ghost", "临时显示 Secret 以便核对")
         self.cli = QLineEdit(shutil.which("claude") or "")
-        self.cli.setPlaceholderText("claude 可执行文件路径")
-        access.add_field("应用 ID", self.app_id)
-        access.add_field("应用 Secret", self.secret)
-        access.add_field("Claude CLI", self.cli, button("浏览…", self.pick_cli, "ghost"))
+        self.cli.setPlaceholderText("claude 可执行文件的绝对路径")
+        self.step_access.add_field("应用 ID", self.app_id)
+        self.step_access.add_field("应用 Secret", self.secret, self.secret_eye)
+        self.step_access.add_field("Claude CLI", self.cli, button("浏览…", self.pick_cli, "ghost"))
         self.docs = QCheckBox("允许读取消息链接中的飞书文档")
-        access.add(self.docs)
-        access.add(
+        self.step_access.add(self.docs)
+        self.conn_detail = QLabel()
+        self.conn_detail.setObjectName("cardHint")
+        self.conn_detail.setWordWrap(True)
+        self.step_access.add(self.conn_detail)
+        self.step_access.add(
             row(
                 button("保存并连接", self.configure, "primary"),
                 button(
@@ -382,32 +463,66 @@ class Window(QMainWindow):
                         {"cli": self.cli.text()},
                         lambda v: QMessageBox.information(self, "CLI 自检", str(v)),
                     ),
+                    tip="跑一次 claude --version，确认路径可执行",
                 ),
             )
         )
-        layout.addWidget(access)
+        layout.addWidget(self.step_access)
 
-        pairing = Card("配对", "把一条飞书私聊认成「本人」，之后只有这个人能驱动会话。")
+        pairing = StepCard(
+            2,
+            "配对本人身份",
+            "把一条飞书私聊认成「本人」，之后只有这个身份能驱动会话。\n"
+            "先点「生成配对命令」，复制它在飞书里私聊机器人发出去，再回来点「确认配对身份」。\n"
+            "挑战码 5 分钟内有效，确认也必须在这 5 分钟内完成；必须是私聊，话题里发无效。",
+        )
+        self.step_pair = pairing
         self.pair = QLineEdit()
         self.pair.setReadOnly(True)
-        self.pair.setPlaceholderText("点「生成配对命令」后，把这行命令发给机器人")
+        self.pair.setPlaceholderText("点「生成配对命令」后，把这行命令复制到飞书私聊发给机器人")
         pairing.add_field("配对命令", self.pair, button("复制", self.copy_pair, "ghost"))
-        self.owner = QLabel("本人：未配对")
+        self.owner = QLabel()
         self.owner.setObjectName("cardHint")
         self.owner.setWordWrap(True)
-        self.candidate = QLabel("候选：无")
+        self.candidate = QLabel()
         self.candidate.setObjectName("cardHint")
         self.candidate.setWordWrap(True)
         pairing.add(self.owner)
         pairing.add(self.candidate)
         pairing.add(
             row(
-                button("生成配对命令", lambda: self.call("pair.begin", {}, self.pair.setText), "primary"),
-                button("确认配对身份", self.confirm_pair),
-                button("解绑", self.revoke, "danger"),
+                button(
+                    "生成配对命令",
+                    lambda: self.call("pair.begin", {}, self.pair.setText),
+                    "primary",
+                    "生成一个 5 分钟有效的一次性挑战码",
+                ),
+                button("确认配对身份", self.confirm_pair, tip="把「候选」写成本人"),
+                button(
+                    "解绑",
+                    self.revoke,
+                    "danger",
+                    "会取消所有在跑和排队的任务，并撤销已登记会话的授权",
+                ),
             )
         )
         layout.addWidget(pairing)
+        self.render_identity(None, None)
+
+        self.step_project = StepCard(
+            3,
+            "登记项目与会话",
+            "选一个项目目录，新建一条会话或接管终端里已经退出的历史。\n"
+            "登记完成后，在飞书私聊里直接发需求就会进任务队列。",
+        )
+        self.project_detail = QLabel()
+        self.project_detail.setObjectName("cardHint")
+        self.project_detail.setWordWrap(True)
+        self.step_project.add(self.project_detail)
+        self.step_project.add(
+            row(button("去「会话」页登记", lambda: self.nav.setCurrentRow(0), "primary"))
+        )
+        layout.addWidget(self.step_project)
 
         upkeep = Card("维护")
         upkeep.add(
@@ -499,20 +614,56 @@ class Window(QMainWindow):
             self.cli.setText(s["cli"])
             self.docs.setChecked(s["docs"])
 
+        connected = bool(s.get("connected"))
         paused = s["paused"]
-        healthy = "正常" in str(s["health"])
-        color = theme.WARNING if paused else (theme.SUCCESS if healthy else theme.DANGER)
+        color, headline = health_view(s["health"], connected)
+        if paused:
+            color = theme.WARNING
+            headline += "（已暂停接单）"
         self.status_strip.set_state(
             color,
-            str(s["health"]) + ("（已暂停接单）" if paused else ""),
-            "当前会话 " + (s["sid"] or "未接管") + f"　·　{len(s['tasks'])} 个任务在列表里",
+            headline,
+            "当前会话 " + (s["sid"] or "未接管") + f"　·　任务 {len(s['tasks'])} 条",
         )
         self.status_strip.pause.setText("恢复接单" if paused else "暂停接单")
-        self.tray.setIcon(QIcon(dot_icon(color, 32)))
-        self.tray.setToolTip(self.status_strip.main.text())
+        self.tray.setIcon(icon.tray_icon(color))
+        self.tray.setToolTip("飞书值班助手 · " + headline)
 
-        self.owner.setText("本人：" + str(s["owner"] or "未配对"))
-        self.candidate.setText("候选：" + str(s["candidate"] or "无"))
+        self.render_identity(s["owner"], s["candidate"])
+        self.update_steps(s, connected, color, headline)
+
+    def update_steps(self, s, connected, color, headline):
+        """三张步骤卡的完成状态，全部由快照推导，不猜。"""
+        if connected:
+            self.step_access.set_state("已连接", "done")
+        elif s["app"]:
+            self.step_access.set_state("未连接", "error" if color == theme.DANGER else "active")
+        else:
+            self.step_access.set_state("待填写", "todo")
+        self.conn_detail.setText(f"长连接状态：{headline}　（引擎原话：{s['health']}）")
+
+        if s["owner"]:
+            self.step_pair.set_state("已配对", "done")
+        elif s["candidate"]:
+            self.step_pair.set_state("待确认", "warn")
+        elif not connected:
+            self.step_pair.set_state("需先连接", "todo")
+        else:
+            self.step_pair.set_state("待配对", "active")
+
+        count = len(s["sessions"])
+        if s["sid"]:
+            self.step_project.set_state("已接管", "done")
+        elif count:
+            self.step_project.set_state("待接管", "active")
+        else:
+            self.step_project.set_state("待登记", "todo")
+        if count:
+            self.project_detail.setText(
+                f"已登记 {count} 个会话，当前接管：{s['sid'] or '无（在「会话」页点「接管」）'}"
+            )
+        else:
+            self.project_detail.setText("还没有登记任何项目。")
 
         active = s["sid"]
         if self.snap.get("sessions") != s["sessions"]:
@@ -565,10 +716,27 @@ class Window(QMainWindow):
     def toggle_pause(self):
         self.call("app.resume" if self.snap.get("paused") else "app.pause")
 
+    def toggle_secret(self):
+        hidden = self.secret.echoMode() == QLineEdit.EchoMode.Password
+        self.secret.setEchoMode(
+            QLineEdit.EchoMode.Normal if hidden else QLineEdit.EchoMode.Password
+        )
+        self.secret_eye.setText("隐藏" if hidden else "显示")
+
     def pick_cli(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 Claude CLI")
         if path:
             self.cli.setText(path)
+
+    def render_identity(self, owner, candidate):
+        """本人 / 候选。引擎存的是 route 数组，直接 str() 出来没法读，只摘关键字段。"""
+        self.owner.setText("本人：" + describe_route(owner, "未配对"))
+        if candidate:
+            self.candidate.setText(
+                "候选：" + describe_route(candidate, "无") + "　← 点「确认配对身份」把它定为本人"
+            )
+        else:
+            self.candidate.setText("候选：无（在飞书私聊里发出配对命令后会出现在这里）")
 
     def copy_pair(self):
         text = self.pair.text()
