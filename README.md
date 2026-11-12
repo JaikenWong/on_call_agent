@@ -80,9 +80,82 @@ python scripts/smoke_runner.py
 Copy-Item config.example.yaml config.yaml
 ```
 
-然后填 `feishu.app_id` / `feishu.app_secret` / `policy.allowed_open_ids`。各字段说明在 `config.example.yaml` 的注释里。
+**必填只有三项**：`feishu.app_id`、`feishu.app_secret`、`policy.allowed_open_ids`（不填等于谁都能驱动你本机的 shell）。其余全有默认值，不写就用默认。
 
-`config.yaml` 已在 `.gitignore` 中，不要提交。
+`config.yaml` 已在 `.gitignore` 中，不要提交。配置不合法时启动会打印具体哪个字段错并**退出码 2**；长连接不可恢复地断掉是**退出码 1**（留给外部守护进程重启）。
+
+下面是全部字段。默认值和取值范围取自 `src/oncall_bot/config.py`，`config.example.yaml` 的键与它逐项核对过。
+
+### `feishu`
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `app_id` | **必填** | 开放平台应用 ID。仍是 `cli_xxx` 这类占位符会被拒 |
+| `app_secret` | **必填** | 应用密钥。永不进日志 |
+
+### `policy`
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `require_mention_in_group` | `true` | 群聊里必须 @ 机器人才响应。私聊不受影响 |
+| `allowed_open_ids` | `[]` | 能驱动会话的人。**留空 = 不限制**，仅私聊自用时可接受。第一次配置时先留空启动，发一条消息，从日志的 `sender_open_id=` 里抄自己的 ID |
+| `allowed_workdir_roots` | `[]` | `/new <路径>` 只允许这些根目录之下的目录。**留空 = `/new` 不接受路径参数**，只能沿用当前会话的仓库。这是安全默认：放开等于让飞书上的人在本机任意目录执行工具。路径会自动展开 `~` 并取绝对路径 |
+
+### `runner`
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `cli_path` | `null` | `null` = 用 claude-agent-sdk 自带的 CLI；也可填本机 `claude` 可执行文件路径 |
+| `permission_mode` | `"bypassPermissions"` | 可选 `default` / `acceptEdits` / `plan` / `bypassPermissions` / `dontAsk` / `auto`。默认值等于工具直接执行、不询问，**风险见第 6 节** |
+| `disallowed_tools` | `rm -rf*` / `git push --force*` / `git reset --hard*` / `git clean -fd*` 四条 | `bypassPermissions` 下仍然生效，是唯一兜底 |
+| `setting_sources` | `["user", "project"]` | 加载哪些配置来源，可选 `user` / `project` / `local`。含 `project` 时会加载目标仓库的 `.claude/`（hooks / MCP / skills） |
+| `model` | `null` | `null` = 继承本机 `~/.claude/settings.json` 里的模型配置 |
+| `max_turns` | `60` | 单轮内最多几个助手回合，`> 0` |
+| `turn_timeout_seconds` | `1800` | 单轮总时长上限，超了等同 `/stop`，`> 0` |
+| `idle_output_timeout_seconds` | `300` | 连续多久没有任何输出就中断，`> 0` |
+| `max_queue` | `5` | 排队上限，满了明确拒绝新消息，`> 0` |
+| `connection_idle_seconds` | `900` | Claude 连接跨轮复用，空闲这么久后断开。**`0` = 永不自动断开**，`>= 0`。见[连接复用](#连接复用) |
+| `env` | `{}` | 透传给 CLI 的环境变量，只在需要覆盖网关 / 模型时才填（如 `ANTHROPIC_BASE_URL`） |
+| `system_prompt_append` | `""` | 追加在 `claude_code` 预设 system prompt 后面。用来告诉模型「你在飞书里被远程调用，用户看不到终端、无法回答交互式提问」 |
+
+### `render`
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `update_interval_ms` | `1200` | 卡片刷新的节流间隔，`>= 200` |
+| `max_card_chars` | `6000` | 单张卡片正文字数上限，`>= 500`。飞书卡片本身有体积限制，别调太大 |
+| `result_inline_max` | `5500` | 最终回答一张卡片装多少字，`>= 500`。超过就按这个尺寸拆成多张卡片。填得比 `max_card_chars` 大会被收敛成后者并记一条 warning |
+| `max_result_cards` | `6` | 回答再长也最多拆这么多张，多出来的截掉并在最后一张说明。`1 ~ 20` |
+| `session_list_limit` | `10` | `/sessions` 列几条，`1 ~ 50` |
+
+### `docs`（飞书云文档链接 → 本地 md）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | `true` | 关掉后消息里的云文档链接原样交给 Claude，不抓取 |
+| `inbox_dir` | `~/.oncall-bot/inbox` | 抓下来的文档落在这里，通过 `add_dirs` 授权给 Claude；**不写进目标仓库** |
+| `max_chars_per_doc` | `200000` | 单篇正文字数上限，`> 0` |
+| `max_docs_per_message` | `5` | 一条消息最多抓几篇，`1 ~ 20` |
+| `fetch_images` | `true` | 是否下载文档内嵌图片到 `<文档>.assets/` |
+| `max_images_per_doc` | `40` | 单篇最多下载几张图，`0 ~ 200` |
+| `max_image_bytes` | `10485760`（10 MB） | 单张图片大小上限，`> 0` |
+
+### `attachments`（消息里的图片和文件）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | `true` | 关掉后收到图片 / 文件只回一句「附件处理已关闭」 |
+| `dir` | `~/.oncall-bot/attachments` | 落盘目录，按 `<会话ID前8位>/` 分子目录，通过 `add_dirs` 授权给 Claude |
+| `max_bytes` | `20971520`（20 MB） | 单个附件大小上限，`> 0`。**不按扩展名过滤文件类型，这是唯一的闸门** |
+| `max_pending` | `9` | 最多攒几个等下一条需求领走，`1 ~ 50`。超了丢最旧的 |
+| `pending_ttl_seconds` | `600` | 攒着的附件多久作废，`> 0` |
+
+### 顶层
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `state_file` | `~/.oncall-bot/state.json` | 活跃会话 + 最后一张卡片的引用。临时文件 + `os.replace` 原子写 |
+| `log_dir` | `~/.oncall-bot/logs` | 日志目录，`oncall-bot.log` 按 8 MB 轮转留 5 份 |
 
 ---
 
@@ -245,7 +318,8 @@ Claude 连接**跨轮复用**，不是每条消息都重启一次。实测在 19
 ```
 src/oncall_bot/
 ├─ __main__.py        入口：加载配置 → 主循环 → 飞书长连接线程
-├─ config.py          pydantic 配置模型与校验
+├─ config.py          pydantic 配置模型与校验（字段表见第 3 节）
+├─ logging_setup.py   文件轮转 + 控制台日志
 ├─ app.py             消息主流程（去重 → @ 校验 → 白名单 → 命令 → 入队）
 ├─ policy.py          message_id TTL 去重
 ├─ state.py           全局活跃会话 + 原子持久化
@@ -312,3 +386,4 @@ python scripts/check_card_markdown.py --sample   # 走真实渲染管线的示�
 - 卡片上**不显示费用**：本机走的是第三方网关，SDK 报的 `total_cost_usd` 是按 Anthropic 价目表估的，和实际计费无关。显示的是耗时 / 轮数 / token 数。
 - `AskUserQuestion` 这类交互式提问走不通，`system_prompt_append` 里已要求模型基于合理假设继续并列出假设。
 - 桥在某轮中途被杀掉时，那张「处理中」卡片会在下次启动时被刷成「状态未知」，但那一轮的真实结果需要你去终端 `claude --resume <id>` 确认。
+- **会话上下文会撑满。** 同一条会话被桥长期 resume 只会越来越大，撞到模型窗口上限时网关直接返回 `400 ... maximum context length`。实测自动压缩在这条路上没生效，到那个点上 `/compact` 本身也超窗口、跑不动。办法是 `/new` 换新会话，或用 `fork_session` 把老会话截断成一条能用的新会话 —— 过程和实测数据见[设计文档 2.10](docs/飞书绑定Claude-Code会话-设计试用指南.md)。另外这个报错目前会被当成模型的正常回答显示在卡片上，日志里查不到。

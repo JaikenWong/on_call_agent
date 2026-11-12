@@ -24,7 +24,7 @@
   注意这条约束说的是「自动」：`/new` 是用户显式下的命令，不违反它。
 - 不做多群并行（B 模式）。全局一条，谁发消息都驱动同一条会话，输出回到发消息的那个会话窗口。
 - 不做 ask 模式审批卡片（见第 12 章 v2）。第一版只有 `trusted`，靠工具黑名单兜底。
-- 支持图片输入（见 9.5）。文件 / 语音 / 表情等其余类型仍然回「暂只支持文本」。
+- 支持文字、图片、文件、富文本（`post`）输入，见 9.5。语音 / 视频 / 表情等其余类型明确回「暂不支持这种消息」。
 - 不做多机部署。桥必须跑在会话所在的这台机器上。
 
 ---
@@ -50,10 +50,17 @@
 - `list_sessions(directory=None, limit=None, offset=0, include_worktrees=True) -> list[SDKSessionInfo]`
   **`directory=None` 时返回全机所有项目的会话**，这正是 `/sessions` 需要的。
 - `get_session_info(session_id, directory=None) -> SDKSessionInfo | None`
-- `delete_session(session_id, directory=None)`、`fork_session(...)`、`rename_session(...)`
+- `delete_session(session_id, directory=None)`、`rename_session(...)`、`tag_session(...)`
+- `get_session_messages(session_id, directory=None, limit=None, offset=0) -> list[SessionMessage]`
+  按 `parentUuid` 串好的消息链，每条带 `uuid`。配下面的 `fork_session` 用。
+- `fork_session(session_id, directory=None, up_to_message_id=None, title=None) -> ForkSessionResult`
+  **在指定消息处截断并复制成一条新会话**（UUID 全部重映射），原文件不动、不调模型。这是上下文撑满之后唯一的离线出路，见 2.10。
+- `ClaudeSDKClient.get_context_usage()`：等价于 CLI 的 `/context`，给出 `totalTokens` `maxTokens` `rawMaxTokens` `percentage` `isAutoCompactEnabled` `autoCompactThreshold`，还有按 system prompt / tools / skills / messages 分类的占用。
+- 客户端方法还有 `set_model` `set_permission_mode` `interrupt` `stop_task` `rewind_files` `get_mcp_status`；**没有** `compact()`。
 - `SDKSessionInfo` 字段：`session_id` `summary` `last_modified`(ms) `file_size` `custom_title` `first_prompt` `git_branch` **`cwd`** `tag` `created_at`
   → **工作目录来自会话本身，用户不需要输路径。**
-- `ClaudeAgentOptions` 确认存在的字段（本方案用到的）：`cwd` `resume` `fork_session` `permission_mode` `allowed_tools` `disallowed_tools` `can_use_tool` `system_prompt` `max_turns` `max_budget_usd` `model` `env` `cli_path` `settings` `setting_sources` `stderr` `hooks` `include_partial_messages` `add_dirs`
+- `ClaudeAgentOptions` 确认存在的字段（本方案用到的）：`cwd` `resume` `session_id` `fork_session` `permission_mode` `allowed_tools` `disallowed_tools` `can_use_tool` `system_prompt` `max_turns` `max_budget_usd` `model` `env` `cli_path` `settings` `setting_sources` `stderr` `hooks` `include_partial_messages` `add_dirs`
+  还有一对用于「从中途分叉」的：`resume_session_at`（只加载到某个 uuid 为止）+ `resume_drops_turn`（校验被丢弃的范围确实只属于那一轮，不符合就拒绝 resume 并抛 `ProcessError`）。
 - `permission_mode` 取值：`default` `acceptEdits` `plan` `bypassPermissions` `dontAsk` `auto`
 - `ResultMessage` 字段：`subtype` `duration_ms` `duration_api_ms` `is_error` `num_turns` `session_id` `stop_reason` `total_cost_usd` `usage` `result` `model_usage` `permission_denials` `errors` `api_error_status` `terminal_reason`
 - 异常类型齐全：`CLINotFoundError` `CLIConnectionError` `ProcessError` `ResultError` `CLIJSONDecodeError`
@@ -206,6 +213,30 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL = deepseek-v4-pro[1m]
 
 `ClaudeAgentOptions.add_dirs: list[str | Path]` 存在 → 抓下来的文档可以放在仓库外，单独授权给 Claude 读。
 
+### 2.10 上下文窗口会撞墙，而 `/compact` 救不了（2026-11-10 实测）
+
+一条被桥长期 resume 的会话（10-15 用到 11-10，1218 个助手回合，transcript 9.7 MB）撞到了网关硬上限：
+
+```
+API Error: 400 This model's maximum context length is 1048576 tokens.
+However, you requested 1072629 tokens (1040629 in the messages, 32000 in the completion).
+```
+
+实测到的几件事：
+
+- **自动压缩在这条路上根本没生效。** 用桥同一套 options 新建一条会话，`get_context_usage()` 报 `isAutoCompactEnabled=True`、`autoCompactThreshold=967000`、`maxTokens = rawMaxTokens = 1000000`；但那条出事会话的 transcript 里 `isCompactSummary` / `compact_boundary` **各 0 次** —— 从头到尾一次都没压缩，上下文一路涨到 1,015,645。
+- **`/compact` 这时也救不了**：压缩本身要把整段历史发给模型做摘要，请求同样超窗口，照样 400。死锁。
+- transcript 里还留着终端跑过的 `Auto-compact window for deepseek-flash set to 850k tokens`，设了 850k 也没触发。这个开关在第三方网关 + 不被识别的模型上指望不上（日志里有 `[claude-code:unrecognized_model]`）。
+- **唯一的离线出路是 `fork_session`**：在某条消息处截断、复制成新会话，不碰原文件、不调模型，所以不会再撞 400。砍掉尾部若干轮让上下文落回窗口内，新会话就能用，那时 `/compact` 也跑得动。
+- 找砍点的办法：扫 transcript 里每个 assistant 条目的 `usage.input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，那就是**该请求发出时的上下文水位**，挑最后一个落在目标以下的 `uuid` 作为 `up_to_message_id`。
+- **注意 fork 保留的是前面、丢的是最近。** 但原始 transcript 一直在 `~/.claude/projects/<项目目录>/<id>.jsonl`，新会话需要细节时让它自己去读那个文件，比把内容塞回上下文更省。
+
+桥这边暴露出的三个缺口（**尚未实现**，见 13）：
+
+- 这个 400 是被 CLI 当成**助手文本**吐出来的：桥照原样渲染进卡片，`is_error` 没置位，**日志里一个字都没有**。应该识别它、换成明确的失败卡片并记 ERROR。
+- `/status` 应该显示上下文水位（`get_context_usage()` 直接能读）。
+- 接近上限时在卡片上主动提醒，而不是让人一路撞墙。
+
 ---
 
 ## 3. 架构
@@ -250,7 +281,7 @@ on_call_bot/
 │  ├─ state.py                    # ActiveSession + 原子持久化
 │  ├─ commands.py                 # 斜杠命令
 │  ├─ docs_fetch.py               # 飞书云文档链接 → 本地 md
-│  ├─ attachments.py              # 消息里的图片 → 本地文件 + 待处理队列
+│  ├─ attachments.py              # 消息里的图片 / 文件 → 本地文件 + 待处理队列
 │  ├─ feishu/
 │  │  ├─ ws.py                    # 长连接线程
 │  │  ├─ api.py                   # areply / apatch / bot open_id
@@ -269,52 +300,27 @@ on_call_bot/
 
 ## 5. 配置（`config.yaml`）
 
-```yaml
-feishu:
-  app_id: "cli_xxx"
-  app_secret: "xxx"
+**字段表不写在这里。** 完整的字段 / 默认值 / 取值范围见 [README 第 3 节](../README.md#3-配置)，可直接拷贝的样例是 `config.example.yaml`。这份设计文档只记**为什么这么设计**——同一张表抄两遍必然有一份变成过期的那份，这个坑已经踩过一次。
 
-policy:
-  require_mention_in_group: true
-  allowed_open_ids:            # 能驱动会话的人；留空表示不限制（仅建议私聊自用时）
-    - "ou_xxx"
+分组和各组的职责：
 
-runner:
-  cli_path: null               # null = 用 SDK 自带 CLI
-  permission_mode: "bypassPermissions"
-  disallowed_tools:            # bypassPermissions 下仍然生效
-    - "Bash(rm -rf*)"
-    - "Bash(git push --force*)"
-    - "Bash(git reset --hard*)"
-  setting_sources: ["user", "project"]   # 加载仓库 .claude/（hooks/MCP/skills）
-  model: null                  # null = 继承 settings.json
-  max_turns: 60
-  turn_timeout_seconds: 1800
-  idle_output_timeout_seconds: 300
-  max_queue: 5
-  env: {}                      # 需要覆盖网关/模型时才填
-  system_prompt_append: |
-    你正通过飞书机器人被远程调用，用户看不到你的终端，也无法回答交互式提问。
-    回复保持简洁，结尾用 3 行以内总结改动。
-    需要用户决策时，基于合理假设继续，并在结尾列出你的假设。
-    涉及生产环境、数据库写操作、强制推送时，先停下来说明风险并等待下一条消息确认。
+| 分组 | 管什么 | 关键决定 |
+|------|--------|----------|
+| `feishu` | 应用凭据 | 两项都必填，占位符（`cli_xxx` 之类）要在校验期拒掉，别等到调接口才报错 |
+| `policy` | 谁能用、能在哪儿用 | `allowed_open_ids` 留空 = 不限制（README 必须警告）；`allowed_workdir_roots` 留空 = `/new` 拒绝路径参数，这是安全默认，见 7.1 |
+| `runner` | 怎么跑 Claude | `permission_mode` + `disallowed_tools` 是安全面；`connection_idle_seconds` 是连接复用的唯一开关（`0` = 永不断开），见 9.2 |
+| `render` | 卡片长什么样 | 节流间隔、单卡容量、长回答拆几张，见 9.6 |
+| `docs` | 云文档抓取 | 独立开关 + 独立目录，和 `attachments` 互不影响，见 9.4 |
+| `attachments` | 消息里的图片 / 文件 | 同上，见 9.5 |
+| 顶层 | 状态与日志落盘位置 | — |
 
-render:
-  update_interval_ms: 1200
-  max_card_chars: 6000
-  session_list_limit: 10
+`config.py` 的硬性要求：
 
-docs:
-  enabled: true
-  inbox_dir: "~/.oncall-bot/inbox"   # 不写进目标仓库，靠 add_dirs 授权
-  max_chars_per_doc: 200000
-  max_docs_per_message: 5
-
-state_file: "~/.oncall-bot/state.json"
-log_dir: "~/.oncall-bot/logs"
-```
-
-`config.py` 要求：启动时校验 `app_id`/`app_secret` 非空；路径字段统一 `expanduser().resolve()`；校验失败打印原因后退出码 2。
+- 启动时校验 `app_id` / `app_secret` 非空且不是占位符。
+- 所有路径字段统一 `expanduser()`；`allowed_workdir_roots` 还要 `resolve()`，否则 `..` 能绕过白名单。
+- 默认值也必须过校验器（`validate_default=True`），否则配置里不写 `inbox_dir` 时 `~` 不会被展开。
+- 校验失败打印到底是哪个字段错，然后**退出码 2**；长连接不可恢复地断掉是**退出码 1**，区分开才能让守护进程只重启后者。
+- 字段之间的约束就地收敛而不是报错：`result_inline_max > max_card_chars` 时按后者处理并记 warning。只想调小单卡容量的人不该被迫改两个值。
 
 ---
 
@@ -426,6 +432,12 @@ def run() -> None:
 ### 8.2 解析（`parser.py`）
 
 ```python
+@dataclass(frozen=True)
+class AttachmentRef:
+    key: str                  # image_key 或 file_key
+    kind: str = "image"       # "image" | "file"，决定下载时传给飞书的 type
+    name: str = ""            # 文件消息带原始文件名；图片没有
+
 @dataclass
 class IncomingMessage:
     message_id: str
@@ -435,9 +447,11 @@ class IncomingMessage:
     sender_open_id: str
     text: str
     mentioned_bot: bool
+    attachments: list[AttachmentRef]
+    # is_attachment_only：有附件但没文字 —— 这种只回执、不跑一轮，见 9.5
 ```
 
-- `message.content` 是 JSON 串：`text` 取 `{"text":…}`；`post` 拼接文本段；其余返回 `None`。
+- `message.content` 是 JSON 串：`text` 取 `{"text":…}`；`image` 取 `image_key`；`file` 取 `file_key` + `file_name`；`post` 拼接文本段并收集其中的 `img` / `file` 标签；其余类型返回 `None`，由调用方回「暂不支持这种消息」。
 - 删除 `@_user_1` 之类占位符；`mentioned_bot` 用 `mentions[*].id.open_id == bot_open_id` 判断。
 - 启动时取机器人 open_id（见 2.8 原生请求写法）并缓存。
 
@@ -459,9 +473,12 @@ class IncomingMessage:
 
 | 卡片 | 内容 |
 |------|------|
-| 运行中 | 标题「处理中 · <仓库名>」；正文累计文本 + 工具调用摘要行；底部「发送 /stop 可中断」 |
-| 完成 | 标题「完成」；正文最终结果；底部耗时、轮数、token 数、会话 ID 前 8 位（**不显示费用**，见 2.6） |
-| 失败 | 标题「失败」；原因 + 下一步建议 |
+| 运行中 `running_card` | 标题「处理中 · <仓库名>」；正文累计文本 + 工具调用摘要行；底部「已运行 Ns · 发送 /stop 可中断」 |
+| 完成 `done_card` | 标题「完成 · <仓库名>」；正文最终结果；底部耗时、轮数、token 数、会话 ID 前 8 位（**不显示费用**，见 2.6）。回答拆成多张时标题带 `（3/3）`，统计信息只出现在这最后一张上 |
+| 续页 `part_card` | 多卡片里除最后一张以外的那些。标题带 `（1/3）`，脚注写「接着看第 2 张」，见 9.6 |
+| 已中断 `aborted_card` | 标题「已中断」；已有输出 + 中断原因 + 「下一条消息会续上」 |
+| 失败 `failed_card` | 标题「失败」；原因 + 下一步建议 |
+| 状态未知 `stale_card` | 进程重启时把上次遗留的「处理中」卡片刷成这个，见第 6 节 `last_card` |
 
 ### 8.5 飞书卡片的 markdown 支持（实测，`scripts/check_card_markdown.py`）
 
@@ -629,27 +646,36 @@ if handle.abort_reason:
 - 抓取环节的任何异常都不能让这一轮失败，按「无文档」继续。
 - 需要的飞书权限：`docx:document:readonly`、`wiki:wiki:readonly`、`drive:drive:readonly`（图片）。
 
-### 9.5 消息里的图片（`attachments.py`）
+### 9.5 消息里的图片和文件（`attachments.py`）
 
-**为什么不是「收到图就跑一轮」**：飞书的图片是独立消息，**不能带文字**。人的习惯是先发图、再打字说要干什么。收到图就跑一轮的话，那一轮没有任何指令纯属浪费，而紧接着的文字消息又看不到图。
+**为什么不是「收到附件就跑一轮」**：飞书的图片和文件都是独立消息，**不能带文字**。人的习惯是先把东西发过去、再打字说要干什么。收到就跑一轮的话，那一轮没有任何指令纯属浪费，而紧接着的文字消息又看不到附件。
 
-所以：纯图片消息只**下载 + 回执**，不进队列；图片攒在 `PendingAttachments` 里，**下一条文字消息入队时领走**，拼进 prompt。
+所以：纯附件消息只**下载 + 回执**，不进队列；附件攒在 `PendingAttachments` 里，**下一条文字消息入队时领走**，拼进 prompt。
 
 ```
 image 消息      → 下载 → 存入 pending → 回执「收到 N 张，把需求发给我」→ 不跑一轮
-post 消息       → 图文混排，一条消息里既有文字又有图 → 直接跑一轮
-text 消息       → 入队时 pending.take()，图片路径拼在需求后面
-/stop /use /new → 清空 pending（换了上下文，旧图不该再跟着跑）
+file 消息       → 同上，回执里列出原始文件名
+post 消息       → 图文混排，一条消息里既有文字又有附件 → 直接跑一轮
+text 消息       → 入队时 pending.take()，附件路径拼在需求后面
+/stop /use /new → 清空 pending（换了上下文，旧附件不该再跟着跑）
+其它类型        → 语音 / 视频等明确回「暂不支持这种消息（收到 xxx）」
 ```
+
+图片和文件走同一条通道，只在两处分叉：下载时传给飞书的 `type`（`image` / `file`），以及落盘命名。
 
 关键设计点：
 
-- **在入队时领走，不是在执行时领走**。排队期间又发了新图，不该混进前面那条需求。
-- `PendingAttachments` 有 TTL（默认 600 秒）和条数上限（默认 9 张）。超时的作废，超量的丢最旧的。
-- 图片存 `attachments.dir/<会话ID前8位>/`，通过 `add_dirs` 授权 Claude 读取，和云文档的 inbox 是两个独立目录、两个独立开关。
-- 扩展名按**文件头魔术字节**判定，不信任消息里声明的类型。
-- 需要权限 `im:resource`。缺权限时**只给一条提示**并停止剩余图片（和云文档图片一样的处理，别刷 N 条）。
-- **前提是模型支持视觉**，否则图下载了也没用。这一点配置里管不了，只能在 README 里写明。
+- **在入队时领走，不是在执行时领走**。排队期间又发了新附件，不该混进前面那条需求。
+- 容量检查必须发生在 `pending.take()` **之前**：否则队列满时附件已经从 pending 里清空、只留在被丢弃的局部变量里，文件还在磁盘上但再也不会被任何消息引用。
+- `PendingAttachments` 有 TTL（默认 600 秒）和条数上限（默认 9 个）。超时的作废，超量的丢最旧的。
+- 存 `attachments.dir/<会话ID前8位>/`，通过 `add_dirs` 授权 Claude 读取，和云文档的 inbox 是两个独立目录、两个独立开关。
+- 落盘名统一带 `时间戳-消息ID片段-序号` 前缀。**只用时间戳会撞名**：同一秒内的两条消息（两连发，或两个人各自发）后写的会直接覆盖先写的。
+- **图片**按文件头魔术字节判定扩展名，不信任消息里声明的类型；**文件**保留原始文件名（清洗掉 `<>:"/\|?*` 和控制字符、长度截断），好让 Claude 一眼看出是什么。
+- prompt 里图片和文件**分两段列**：图片写「请用 Read 工具查看」，文件写「按扩展名判断类型，文本类直接 Read，二进制的用合适的命令处理」。按扩展名分类，所以文件消息发来的 `.png` 也算图片——Read 一样能看。
+- **不按扩展名过滤文件类型**。在桥这一层猜「哪些类型有用」只会挡掉正当需求，`max_bytes` 才是闸门。代价是扔个 `.zip` 过去，Claude 可能只能告诉你它解不开。
+- 需要权限 `im:resource`（图片和文件共用）。缺权限时**只给一条提示**并停止剩余附件（和云文档图片一样的处理，别刷 N 条）。
+- **图片前提是模型支持视觉**，否则下载了也没用；文件没有这个限制。这一点配置里管不了，只能在 README 里写明。
+- 群里发附件不会触发：附件消息带不了 @，`require_mention_in_group: true` 时会被忽略。
 
 二进制下载接口的老问题在这里也一样：`message_resource.aget` 成功时 `resp.code` 是 None、`success()` 返回 False，必须看 `raw.status_code`。这段逻辑和 `drive media` 共用 `_binary_payload()`。
 
@@ -664,7 +690,23 @@ text 消息       → 入队时 pending.take()，图片路径拼在需求后面
 | `ResultMessage` | 生成完成 / 失败卡片 |
 
 - **节流**：脏标记 + 定时刷新，两次 `apatch` 间隔 ≥ `update_interval_ms`；最后一次必须发出。
-- **截断**：正文超 `max_card_chars` 保留尾部，开头加「…（前文已截断）」。最终结果过长则卡片放摘要，全文用文字消息分段补发（每段 ≤ 4000 字）。
+- **串行化 patch**：刷新和定稿都发 `apatch`，必须共用一把锁。否则一次慢的「处理中」请求可能后到，把已经发出的最终卡片覆盖回去，看起来就像永远卡在运行中。定稿之后到达的节流刷新一律丢弃。
+- **截断**：流式正文超 `max_card_chars` 保留尾部，开头加「…（前文已截断）」。
+
+**长回答拆成多张卡片**（`split_for_cards()`）：
+
+最终回答不超过 `result_inline_max` 就一张卡片发完；超过就按同样尺寸拆成多张——运行中那张**就地定稿成第 1 张**，其余作为新卡片回复到同一条用户消息下。
+
+```
+标题     完成 · <仓库>（2/3）
+非末张   脚注写「回答较长，分 3 张卡片发出 · 接着看第 3 张」
+末张     带耗时 / 轮数 / tokens —— 看到统计信息就说明读完了
+超上限   最多 max_result_cards 张，多出来的截掉并在最后一张注明省略了多少字
+```
+
+- **按行切，不把一行劈开**（单行本身超长时才硬切，通常是压在一行里的长 JSON / base64）。
+- **代码围栏跨卡片时，下一张开头补回 ` ```lang `**，收尾由 `to_feishu_markdown()` 的「补上未闭合围栏」那一步负责。不补开头的话，后半段代码会被当成正文渲染。
+- 曾经的做法是**卡片放流式正文 + 纯文本补发全文**，两条消息、同一个答案，看起来像回了两遍，而且两条的内容还不是一回事（一个是整轮流式、一个是最终回答）。换成多卡片之后不再发纯文本。
 
 **`to_feishu_markdown()`** —— 把标准 markdown 调成飞书能渲染的形式（依据 8.5 的实测结果）：
 
@@ -674,7 +716,7 @@ text 消息       → 入队时 pending.take()，图片路径拼在需求后面
 | markdown 表格 | → 丢进 ```` ```text ```` 围栏 | 等宽字体能保住列对齐，比裸竖线可读 |
 | 代码围栏 | 原样保留 | 飞书支持，还有行号和高亮 |
 | 列表 | 原样保留 | `markdown` 组件支持嵌套 |
-| 行内代码 `` `x` `` | 原样保留 | 飞书不渲染，但反引号本身就是「这是标识符」的通用约定，去掉反而丢信息 |
+| 行内代码 `` `x` `` | → `<font color='blue'>x</font>` | 飞书不渲染行内代码，反引号会裸露出来。实测只有 `<font color>` 有效：`<code>` / `<u>` 被静默吃掉，`grey` 不在调色板里，`red` 像报错，加粗会和模型自己的加粗混在一起 |
 
 两个边界情况：
 
@@ -707,13 +749,13 @@ text 消息       → 入队时 pending.take()，图片路径拼在需求后面
 | M5 云文档链接 | `docs_fetch.py`、`docx_render.py`、`add_dirs` | 贴 docx 链接后 Claude 能读到正文和图片；贴表格链接明确回不支持；无权限时提示具体要加什么且不伪造内容 |
 | M6 收尾 | README、冒烟脚本 | `scripts/smoke_runner.py` 全绿；`ruff check` 无报错；按第 12 章走一遍 |
 
-**实现状态（2026-11-04）**
+**实现状态（2026-11-12）**
 
-M0–M7 已完成。
+M0–M7 已完成。之后又加了两项：消息里的**文件**附件（和图片共用 9.5 的通道）、长回答**拆成多张卡片**（9.6）。
 
 **自动化验证**
 
-- `scripts/smoke_runner.py`：166 项检查全绿（真实 Claude SDK + 假飞书 API）。覆盖 resume 上下文延续、会话丢失、命令解析、队列上限、超时中断、连接复用与丢弃、`/new` 真实建会话、后台任务串轮（回放实测序列）、云文档抓取与图片、消息图片、飞书 markdown 转换、各种降级路径。
+- `scripts/smoke_runner.py`：198 项检查全绿（真实 Claude SDK + 假飞书 API）。覆盖 resume 上下文延续、会话丢失、命令解析、队列上限、超时中断、连接复用与丢弃、`/new` 真实建会话、后台任务串轮（回放实测序列）、云文档抓取与图片、消息里的图片和文件、长回答拆卡片、飞书 markdown 转换、各种降级路径。
 - `scripts/check_feishu_doc.py`：真实凭据 + 真实文档（234 block）。正文 9268 字（纯文本接口只有 6883 字），24 张图位置全部正确。
 - `scripts/check_card_markdown.py`：三张对照卡片确定了飞书 markdown 的支持范围（见 8.5）。
 - `scripts/bench_startup.py`：连接复用的收益（见 2.3）。
@@ -726,10 +768,12 @@ M0–M7 已完成。
 - 卡片 markdown：代码块带行号高亮、列表样式、表格对齐、行内代码蓝色
 - 云文档链接：正文可读；图片因文档「仅可编辑的人可下载」而 403，降级提示符合预期
 - 消息图片：纯图片回执不跑一轮 → 下一条需求带上图 → Claude 能看到图的内容
+- 卡片节流：长任务中途确实逐步刷新（真实跑一轮时每 1~20 秒一次 `apatch`，见日志）
 
 **仍未真机验证**
 
-- 卡片节流的实际观感（长任务中途是否逐步刷新）
+- 文件附件：下载、落盘名、Claude 实际读到文件内容（自动化验证已过）
+- 长回答拆多张卡片：飞书里连续多张卡片的实际观感（自动化验证已过）
 - 运行中连发多条的排队表现
 - 空闲超时自动断连
 - 重启后残留「处理中」卡片被刷成「状态未知」
@@ -759,7 +803,11 @@ M0–M7 已完成。
 - [ ] `/new` 后发需求，终端 `claude --resume <新id>` 能看到这条新会话
 - [ ] 未配 `allowed_workdir_roots` 时 `/new <路径>` 被拒并说明怎么配
 - [ ] 发一张截图 → 收到回执且不跑一轮；接着发文字需求 → 卡片标注「带了 N 张图片」且 Claude 的回答确实提到了图里的内容
-- [ ] `/stop` 之后攒着的图片被清掉
+- [ ] 发一个文件（如 `.html`）→ 回执里列出原始文件名；接着发需求 → 卡片标注「带了 N 个文件」且 Claude 确实读到了文件内容
+- [ ] 落盘文件名保留了原始文件名，带非法字符的文件名被清洗且没有逃出 `attachments.dir`
+- [ ] `/stop` 之后攒着的附件被清掉
+- [ ] 让它写一段长回答（超过 `result_inline_max`）→ 拆成多张卡片，标题带 `（n/N）`，统计信息只在最后一张，**没有**额外的纯文本全文
+- [ ] 长回答里包含代码块且正好跨卡片 → 后半段仍然渲染成代码块，不是正文
 
 ---
 
@@ -769,7 +817,7 @@ M0–M7 已完成。
 - B 模式：按 `chat_id` 多绑定并行。
 - `AskUserQuestion` 做成飞书选项卡片（第一版由 `system_prompt_append` 要求模型自行假设）。
 - `include_partial_messages=True` 做 token 级流式（第一版按消息块更新够用）。
-- **文件附件输入**：`client.im.v1.message_resource.aget` 已确认存在，可按 `file_key` 下载群里发的 `.md` / `.pdf` / `.docx` 到 inbox。需要权限 `im:resource`，并加大小与扩展名白名单。
+- **上下文水位与溢出处理**（2.10 挖出来的三个缺口）：识别上下文溢出并给出明确提示 + ERROR 日志、`/status` 显示 `get_context_usage()` 的水位、接近上限时卡片提醒。可能还要把 `fork_session` 包成一个命令（`/fork <水位>`）。
 - **更多云文档类型**：电子表格（`sheets.v3`）、多维表格（`bitable.v1`）、旧版文档（`drive.v1.export_task` 异步导出）。
 - Watcher / PR Reviewer / 项目知识文件。
 
