@@ -241,16 +241,41 @@ However, you requested 1072629 tokens (1040629 in the messages, 32000 in the com
 
 ## 3. 架构
 
+消息从飞书进来到卡片发出的完整路径，含每一个「到此为止」的出口（实现在 `app.py::_handle_message`）：
+
+```mermaid
+flowchart TD
+    A["飞书用户发消息<br/>私聊直接发 · 群里 @机器人"] --> B["lark.ws.Client 长连接<br/>独立线程 + 自带 event loop · 无需公网"]
+    B --> C["run_coroutine_threadsafe<br/>投递到 asyncio 主循环"]
+    C --> D{"message_id 重复推送?"}
+    D -->|是| X1["丢弃"]
+    D -->|否| E{"消息类型能解析?"}
+    E -->|"语音 / 视频等"| X2["回「暂不支持这种消息」"]
+    E -->|"文字 / 图片 / 文件 / 富文本"| F{"群聊里但没 @ 机器人?"}
+    F -->|是| X3["静默忽略"]
+    F -->|否| G{"在 allowed_open_ids 里?"}
+    G -->|否| X4["回「无权限」"]
+    G -->|是| H{"带附件?"}
+    H -->|是| I["下载 → 存入 PendingAttachments"]
+    I --> J{"只有附件没有文字?"}
+    J -->|是| X5["回执「收到 N 个」<br/>不跑一轮，等下一条需求"]
+    J -->|否| K
+    H -->|否| K{"是 / 开头的命令?"}
+    K -->|是| X6["CommandHandler<br/>/sessions /use /new /status /stop /help"]
+    K -->|否| L{"有活跃会话?"}
+    L -->|否| X7["回「还没有选择会话」"]
+    L -->|是| M{"队列有空位?"}
+    M -->|否| X8["回「队列已满」<br/>pending 保留不动，下一条成功的需求会带上"]
+    M -->|是| N["pending.take 领走附件 → 入队"]
+    N --> O["全局唯一 worker<br/>严格串行，两个进程同写一条会话会损坏历史"]
+    O --> P["SessionRunner.run_turn<br/>resume=活跃会话ID · cwd=会话自己的仓库"]
+    P --> Q["TurnRenderer 节流更新同一张卡片<br/>→ 完成 / 失败 / 已中断"]
 ```
-飞书用户 @机器人
-  → lark.ws.Client 长连接（独立线程，内部自带 event loop，无需公网）
-  → run_coroutine_threadsafe 投递到 asyncio 主循环
-  → Policy：message_id 去重 / 群内 @ 校验（私聊跳过）/ open_id 白名单
-  → 命令？ → /sessions /use /status /stop /help
-  → 否则 → 单条 FIFO 队列（全局唯一 worker，严格串行）
-  → Runner：ClaudeSDKClient(resume=active.session_id, cwd=active.workdir) 跑一轮
-  → Renderer：SDK 消息 → 节流更新同一张飞书卡片
-```
+
+两个容易写错的地方,图上特意画出来了:
+
+- **队列容量检查必须在 `pending.take()` 之前**。反过来的话,队列满时附件已经从 pending 里清空、只留在被丢弃的局部变量里,文件还在磁盘上但再也不会被任何消息引用。
+- **纯附件消息不进队列**。飞书的图片 / 文件是独立消息、带不了文字,收到就跑一轮等于跑一轮没有指令的空转,见 9.5。
 
 不得偏离的决策：
 
@@ -542,7 +567,71 @@ class IncomingMessage:
 4. 空闲超时
 5. 桥退出
 
+```mermaid
+stateDiagram-v2
+    state "未连接" as IDLE
+    state "已连接 · 绑定会话 S" as WARM
+
+    [*] --> IDLE
+    IDLE --> WARM : acquire S，connect 实测 5.7s
+    WARM --> WARM : acquire 同一个 S，直接复用
+    WARM --> WARM : query / receive，touch 刷新空闲计时
+    WARM --> IDLE : acquire 另一条会话，先 close 再 connect
+    WARM --> IDLE : /stop 或超时中断，interrupt 后连接不可复用
+    WARM --> IDLE : ResultError / ProcessError / CLI 异常
+    WARM --> IDLE : /use 或 /new 切换会话
+    WARM --> IDLE : 空闲超过 connection_idle_seconds
+    WARM --> [*] : 桥退出
+```
+
+`WARM` 只有一个,不是每条会话一个 —— A 模式同一时刻只有一条活跃会话。所以「切到另一条会话」必然先断旧的,这也是为什么桥占着某条会话时**不能在终端里打开同一条**。
+
 ### 9.3 单轮（`session_runner.py`）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as 飞书
+    participant D as Dispatcher
+    participant R as SessionRunner
+    participant C as SessionConnection
+    participant V as TurnRenderer
+    participant K as Claude CLI
+
+    D->>R: run_turn，取出排队的一轮
+    Note over R: 超时时基从这里起算<br/>排队等待的时间不计入
+    opt 连接不是 warm 且不是 pending_create
+        R->>R: get_session_info 校验会话文件还在
+        Note over R,F: 不在就发失败卡片并返回<br/>绝不静默新建会话
+    end
+    R->>F: reply_card 运行中卡片
+    R->>R: set_last_card，进程被杀后能刷成「状态未知」
+    R->>V: start，启动节流刷新循环
+    R->>R: 抓云文档 → 拼附件路径 → prompt
+    R->>C: acquire
+    alt 已有同会话连接
+        C-->>R: 直接复用，省掉 connect
+    else 冷启动
+        C->>K: connect，实测 5.7s
+    end
+    opt 等连接期间已被 /stop
+        R->>C: close，本轮作废不白跑 query
+    end
+    R->>R: 启动 monitor，看总时长与无输出时长
+    R->>K: query prompt
+    loop 每条 SDK 消息
+        K-->>R: AssistantMessage / ToolUseBlock / ResultMessage
+        R->>V: feed
+        V->>F: apatch，节流更新同一张卡片
+    end
+    Note over R,K: TurnStream 按 origin 过滤<br/>后台任务的 ResultMessage 不算本轮收尾，见 2.5
+    R->>R: 取消 monitor · connection.touch · 中断过则 close
+    R->>R: session_id 核对 · finish_pending_create · touch_active
+    R->>V: finalize，完成 / 失败 / 已中断卡片
+    opt 回答超过 result_inline_max
+        R->>F: reply_card 续页第 2…N 张，统计信息在末张
+    end
+```
 
 ```python
 # 连接还活着就说明会话是活的，不必再查文件；冷启动时才检查
